@@ -449,7 +449,9 @@ impl G722Encoder {
         // Block 1L, QUANTL - Quantize difference signal
         let wd = el.abs().wrapping_sub((el >> 31) & 1);
 
-        // Find quantization interval using linear search (more predictable for audio)
+        // Find quantization interval using linear search. This early-exits on
+        // the first (typically low) crossing, which beats a binary search on
+        // real speech — measured on-device (2026-10-08).
         let lsf = self.band[0].log_scale_factor;
         let mut quantization_idx = 1;
         while quantization_idx < 30 {

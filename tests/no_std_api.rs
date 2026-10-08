@@ -192,7 +192,7 @@ fn test_byte_helpers_unaligned_buffer() {
 fn test_resampler_into_roundtrip_via_borrowed_coeffs() {
     use audio_codec::resampler::{COEFFS_LEN, Resampler};
 
-    let mut coeffs = vec![0.0f32; COEFFS_LEN];
+    let mut coeffs = vec![0i16; COEFFS_LEN];
     let mut r = Resampler::new(8000, 16000, &mut coeffs).expect("resampler init");
 
     let input: Vec<i16> = (0..80).map(|i| (i * 100) as i16).collect();
@@ -216,7 +216,7 @@ fn test_resampler_into_roundtrip_via_borrowed_coeffs() {
 fn test_resampler_rejects_undersized_coeffs() {
     use audio_codec::resampler::Resampler;
 
-    let mut too_small = vec![0.0f32; 100];
+    let mut too_small = vec![0i16; 100];
     let res = Resampler::new(8000, 16000, &mut too_small);
     assert!(matches!(res, Err(CodecError::BufferTooSmall)));
 }
@@ -225,7 +225,7 @@ fn test_resampler_rejects_undersized_coeffs() {
 fn test_resampler_rejects_zero_rate() {
     use audio_codec::resampler::Resampler;
 
-    let mut coeffs = vec![0.0f32; audio_codec::resampler::COEFFS_LEN];
+    let mut coeffs = vec![0i16; audio_codec::resampler::COEFFS_LEN];
     let res = Resampler::new(0, 8000, &mut coeffs);
     assert!(matches!(res, Err(CodecError::InvalidInput)));
 }

@@ -12,6 +12,15 @@ pub const TAPS_PER_PHASE: usize = 24;
 /// Required length of the caller-provided coefficient buffer (`NUM_PHASES * TAPS_PER_PHASE`).
 pub const COEFFS_LEN: usize = NUM_PHASES * TAPS_PER_PHASE;
 
+/// Fixed-point scale for the polyphase coefficients and the FIR accumulator
+/// (Q15: one unit = 1/32768).
+const Q15_SHIFT: u32 = 15;
+/// Fractional bits of the phase accumulator. The top 8 bits of the fraction
+/// select one of the 256 phases.
+const PHASE_BITS: u32 = 24;
+/// One whole input sample in phase-accumulator units (`1 << PHASE_BITS`).
+const PHASE_ONE: u32 = 1 << PHASE_BITS;
+
 /// `f64::sin` polyfill that works in both std and no_std (via libm).
 #[inline]
 fn fsin(x: f64) -> f64 {
@@ -38,15 +47,46 @@ fn fsqrt(x: f64) -> f64 {
     }
 }
 
+/// `f64::round` polyfill (round half away from zero).
+#[inline]
+fn fround(x: f64) -> f64 {
+    #[cfg(feature = "std")]
+    {
+        x.round()
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        libm::round(x)
+    }
+}
+
+/// Polyphase resampler.
+///
+/// The filter runs entirely in **fixed point** (Q15 i16 coefficients, i16
+/// history, i64 accumulator, integer phase accumulator). This matters on
+/// targets without an FPU (e.g. ESP32-S3 / Xtensa LX7): a soft-float `f32`
+/// FIR is ~20× slower than the equivalent integer one there. Coefficients are
+/// still *designed* in `f64` at construction time and quantised once.
+///
+/// The coefficient buffer is **Q15 `i16`** (6144 entries, 12 KB) supplied by
+/// the caller so this type stays `no_std`/allocation-free.
 pub struct Resampler<'a> {
     input_rate: usize,
     output_rate: usize,
     ratio: f64,
-    coeffs: &'a mut [f32],
-    num_phases: usize,
+    coeffs: &'a mut [i16],
     taps_per_phase: usize,
-    history: [f32; TAPS_PER_PHASE],
-    current_pos: f64,
+    /// Sliding window of the last `TAPS_PER_PHASE` inputs, held in a double
+    /// buffer to avoid shifting on every input sample: new samples are
+    /// appended at `w`, the window is `history[w - TAPS .. w]`, and the
+    /// buffer is compacted once every `TAPS_PER_PHASE` inputs.
+    history: [i16; 2 * TAPS_PER_PHASE],
+    /// Write cursor into `history` (`TAPS_PER_PHASE ..= 2 * TAPS_PER_PHASE`).
+    w: usize,
+    /// Phase within the current input sample, Q24 (`0..PHASE_ONE`).
+    pos: u32,
+    /// Phase advance per output sample, Q24 (= `input_rate / output_rate`).
+    step: u32,
 }
 
 fn bessel_i0(x: f64) -> f64 {
@@ -75,16 +115,16 @@ fn kaiser_window(n: usize, n_total: usize, beta: f64) -> f64 {
 }
 
 impl<'a> Resampler<'a> {
-    /// Create a new `Resampler`, writing polyphase filter coefficients into the
-    /// caller-provided buffer.
+    /// Create a new `Resampler`, writing Q15 polyphase filter coefficients into
+    /// the caller-provided buffer.
     ///
-    /// `coeffs.len()` must be at least [`COEFFS_LEN`] (= 6144 floats, ~24 KB).
+    /// `coeffs.len()` must be at least [`COEFFS_LEN`] (= 6144 `i16`, 12 KB).
     /// The buffer is held by the resampler for its entire lifetime; it is
     /// written once here and read on every subsequent `resample_into` call.
     pub fn new(
         input_rate: usize,
         output_rate: usize,
-        coeffs: &'a mut [f32],
+        coeffs: &'a mut [i16],
     ) -> Result<Self, CodecError> {
         if coeffs.len() < COEFFS_LEN {
             return Err(CodecError::BufferTooSmall);
@@ -99,6 +139,13 @@ impl<'a> Resampler<'a> {
         let num_phases = NUM_PHASES;
         let taps_per_phase = TAPS_PER_PHASE;
         let filter_len = num_phases * taps_per_phase;
+
+        // Integer phase step (input samples consumed per output sample).
+        let step_f = (input_rate as f64 / output_rate as f64) * PHASE_ONE as f64;
+        if !(step_f >= 1.0 && step_f < u32::MAX as f64) {
+            return Err(CodecError::InvalidInput);
+        }
+        let step = fround(step_f) as u32;
 
         let coeffs = &mut coeffs[..filter_len];
 
@@ -135,8 +182,9 @@ impl<'a> Resampler<'a> {
             }
 
             for t in 0..taps_per_phase {
-                let normalized = (phase_coeffs[t] / sum) as f32;
-                coeffs[p * taps_per_phase + t] = normalized;
+                // Quantise the normalised tap to Q15.
+                let q = fround((phase_coeffs[t] / sum) * 32768.0);
+                coeffs[p * taps_per_phase + t] = q.clamp(-32768.0, 32767.0) as i16;
             }
         }
 
@@ -145,10 +193,11 @@ impl<'a> Resampler<'a> {
             output_rate,
             ratio,
             coeffs,
-            num_phases,
             taps_per_phase,
-            history: [0.0; TAPS_PER_PHASE],
-            current_pos: 0.0,
+            history: [0; 2 * TAPS_PER_PHASE],
+            w: TAPS_PER_PHASE,
+            pos: 0,
+            step,
         })
     }
 
@@ -160,72 +209,19 @@ impl<'a> Resampler<'a> {
         self.output_rate
     }
 
+    /// Q15 dot product of the 24-tap window against one phase, accumulated in
+    /// `i64` (worst-case `24 * 32768 * 32767` overflows `i32`). The `i16`×`i16`
+    /// product itself fits in `i32`, so only the accumulation widens.
+    ///
+    /// Takes fixed-size array refs so the outer loops' slice↔array `try_into`
+    /// is the only length check (the `i16` indices below are unchecked).
     #[inline(always)]
-    fn dot_product(a: &[f32], b: &[f32]) -> f32 {
-        debug_assert_eq!(a.len(), TAPS_PER_PHASE);
-        debug_assert_eq!(b.len(), TAPS_PER_PHASE);
-
-        #[cfg(target_arch = "aarch64")]
-        {
-            // ARM NEON: 24 taps = 6 iterations of 4-wide vectors
-            unsafe {
-                use core::arch::aarch64::*;
-                let mut sumv = vdupq_n_f32(0.0);
-                for i in (0..TAPS_PER_PHASE).step_by(4) {
-                    let av = vld1q_f32(a.as_ptr().add(i));
-                    let bv = vld1q_f32(b.as_ptr().add(i));
-                    sumv = vfmaq_f32(sumv, av, bv);
-                }
-                vaddvq_f32(sumv)
-            }
+    fn dot_q15(history: &[i16; TAPS_PER_PHASE], coeffs: &[i16; TAPS_PER_PHASE]) -> i32 {
+        let mut acc: i64 = 0;
+        for i in 0..TAPS_PER_PHASE {
+            acc += ((history[i] as i32) * (coeffs[i] as i32)) as i64;
         }
-        #[cfg(all(target_arch = "x86_64", target_feature = "avx"))]
-        {
-            unsafe {
-                use core::arch::x86_64::*;
-                let mut sumv = _mm256_setzero_ps();
-                for i in (0..TAPS_PER_PHASE).step_by(8) {
-                    let av = _mm256_loadu_ps(a.as_ptr().add(i));
-                    let bv = _mm256_loadu_ps(b.as_ptr().add(i));
-                    sumv = _mm256_add_ps(sumv, _mm256_mul_ps(av, bv));
-                }
-                // Horizontal sum
-                let x128 = _mm_add_ps(_mm256_extractf128_ps(sumv, 1), _mm256_castps256_ps128(sumv));
-                let x64 = _mm_add_ps(x128, _mm_movehl_ps(x128, x128));
-                let x32 = _mm_add_ss(x64, _mm_shuffle_ps(x64, x64, 0x55));
-                _mm_cvtss_f32(x32)
-            }
-        }
-        #[cfg(all(
-            target_arch = "x86_64",
-            target_feature = "sse2",
-            not(target_feature = "avx")
-        ))]
-        {
-            unsafe {
-                use core::arch::x86_64::*;
-                let mut sumv = _mm_setzero_ps();
-                for i in (0..TAPS_PER_PHASE).step_by(4) {
-                    let av = _mm_loadu_ps(a.as_ptr().add(i));
-                    let bv = _mm_loadu_ps(b.as_ptr().add(i));
-                    sumv = _mm_add_ps(sumv, _mm_mul_ps(av, bv));
-                }
-                let x64 = _mm_add_ps(sumv, _mm_shuffle_ps(sumv, sumv, 0x4e));
-                let x32 = _mm_add_ss(x64, _mm_shuffle_ps(x64, x64, 0x11));
-                _mm_cvtss_f32(x32)
-            }
-        }
-        #[cfg(not(any(
-            target_arch = "aarch64",
-            all(target_arch = "x86_64", target_feature = "sse2")
-        )))]
-        {
-            let mut s = 0.0f32;
-            for i in 0..TAPS_PER_PHASE {
-                s += a[i] * b[i];
-            }
-            s
-        }
+        (acc >> Q15_SHIFT) as i32
     }
 
     /// Resample `input` into the caller-provided `out` buffer.
@@ -246,32 +242,42 @@ impl<'a> Resampler<'a> {
             return Ok(input.len());
         }
 
-        let inv_ratio = 1.0 / self.ratio;
         let taps = self.taps_per_phase;
-        let num_phases_f = self.num_phases as f64;
-
+        let two_taps = 2 * taps;
         let mut written = 0usize;
 
         for &sample in input {
-            self.history.copy_within(1..taps, 0);
-            self.history[taps - 1] = sample as f32;
-
-            while self.current_pos < 1.0 {
-                let phase_idx = (self.current_pos * num_phases_f) as usize;
-                let phase_idx = phase_idx.min(self.num_phases - 1); // Safety clamp
-                let offset = phase_idx * taps;
-                let phase_coeffs = &self.coeffs[offset..offset + taps];
-
-                let out_sample = Self::dot_product(phase_coeffs, &self.history);
-
-                if written >= out.len() {
-                    return Err(CodecError::BufferTooSmall);
-                }
-                out[written] = out_sample.clamp(i16::MIN as f32, i16::MAX as f32) as i16;
-                written += 1;
-                self.current_pos += inv_ratio;
+            // Compact the double buffer only once per `taps` inputs.
+            if self.w == two_taps {
+                self.history.copy_within(taps..two_taps, 0);
+                self.w = taps;
             }
-            self.current_pos -= 1.0;
+            self.history[self.w] = sample;
+            self.w += 1;
+
+            if self.pos < PHASE_ONE {
+                let base = self.w - taps;
+                let win: &[i16; TAPS_PER_PHASE] = self.history[base..base + taps]
+                    .try_into()
+                    .unwrap();
+
+                while self.pos < PHASE_ONE {
+                    // Top 8 bits of the fraction select the phase (0..=255).
+                    let phase_idx = (self.pos >> (PHASE_BITS - 8)) as usize;
+                    let offset = phase_idx * taps;
+                    let phase_coeffs: &[i16; TAPS_PER_PHASE] =
+                        self.coeffs[offset..offset + taps].try_into().unwrap();
+                    let out_sample = Self::dot_q15(win, phase_coeffs);
+
+                    if written >= out.len() {
+                        return Err(CodecError::BufferTooSmall);
+                    }
+                    out[written] = out_sample.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+                    written += 1;
+                    self.pos += self.step;
+                }
+            }
+            self.pos -= PHASE_ONE;
         }
 
         Ok(written)
@@ -301,8 +307,9 @@ impl<'a> Resampler<'a> {
     }
 
     pub fn reset(&mut self) {
-        self.history.fill(0.0);
-        self.current_pos = 0.0;
+        self.history.fill(0);
+        self.w = self.taps_per_phase;
+        self.pos = 0;
     }
 }
 
@@ -314,7 +321,7 @@ pub fn resample(input: &[Sample], input_sample_rate: u32, output_sample_rate: u3
     if input_sample_rate == output_sample_rate {
         return input.to_vec();
     }
-    let mut coeffs = vec![0.0f32; COEFFS_LEN];
+    let mut coeffs = vec![0i16; COEFFS_LEN];
     let mut r = match Resampler::new(
         input_sample_rate as usize,
         output_sample_rate as usize,
@@ -328,7 +335,7 @@ pub fn resample(input: &[Sample], input_sample_rate: u32, output_sample_rate: u3
 
 /// Self-contained [`Resampler`] that owns its coefficient buffer (std only).
 ///
-/// [`Resampler`] borrows a ~24 KB caller-provided coefficient slice, which
+/// [`Resampler`] borrows a ~12 KB caller-provided coefficient slice, which
 /// makes it awkward to store as a long-lived struct field (the buffer must
 /// outlive the resampler). `BoxedResampler` heap-allocates the coefficients
 /// once and keeps them alive for the resampler's whole lifetime, restoring
@@ -341,7 +348,9 @@ pub struct BoxedResampler {
     /// below relies on. Field order matters for drop: `inner` (borrower)
     /// must drop before `coeffs` (borrowed).
     inner: Resampler<'static>,
-    coeffs: Box<[f32]>,
+    /// Kept alive only to back `inner`'s `'static` borrow; never read.
+    #[allow(dead_code)]
+    coeffs: Box<[i16]>,
 }
 
 #[cfg(feature = "std")]
@@ -351,7 +360,7 @@ impl BoxedResampler {
     /// Fails only for zero rates (the coefficient buffer is always sized
     /// correctly internally).
     pub fn new(input_rate: usize, output_rate: usize) -> Result<Self, CodecError> {
-        let mut coeffs = vec![0.0f32; COEFFS_LEN].into_boxed_slice();
+        let mut coeffs = vec![0i16; COEFFS_LEN].into_boxed_slice();
         // SAFETY: `coeffs` is a heap box whose address cannot change while
         // the allocation lives. We extend the borrow to 'static solely to
         // store both the buffer and its borrower in the same struct; the
@@ -359,7 +368,7 @@ impl BoxedResampler {
         // else can reach the buffer (it is moved into `Self` right after).
         let inner = unsafe {
             let ptr = coeffs.as_mut_ptr();
-            let loan: &'static mut [f32] = core::slice::from_raw_parts_mut(ptr, coeffs.len());
+            let loan: &'static mut [i16] = core::slice::from_raw_parts_mut(ptr, coeffs.len());
             Resampler::new(input_rate, output_rate, loan)?
         };
         Ok(Self { inner, coeffs })
@@ -398,7 +407,7 @@ mod tests {
 
     fn new_resampler(input_rate: usize, output_rate: usize) -> Resampler<'static> {
         // Leak intentionally: tests are short-lived and we need a 'static reference.
-        let coeffs: &'static mut [f32] = Box::leak(vec![0.0f32; COEFFS_LEN].into_boxed_slice());
+        let coeffs: &'static mut [i16] = Box::leak(vec![0i16; COEFFS_LEN].into_boxed_slice());
         Resampler::new(input_rate, output_rate, coeffs).expect("resampler init")
     }
 
@@ -537,6 +546,56 @@ mod tests {
         );
     }
 
+    /// The Q15 integer core must match an f32 accumulator using the *same*
+    /// quantised coefficients — going integer must not change the result
+    /// beyond rounding. (Coefficient quantisation itself is covered by the
+    /// passband/aliasing tests above.)
+    #[test]
+    fn test_q15_core_matches_float_reference() {
+        let fin = 16000usize;
+        let fout = 48000usize;
+        let mut coeffs = vec![0i16; COEFFS_LEN];
+        let mut r = Resampler::new(fin, fout, &mut coeffs).unwrap();
+
+        let input: Vec<i16> = (0..2000).map(|i| (((i * 37) % 200 - 100) * 60) as i16).collect();
+        let got = r.resample(&input);
+
+        // f32 reference: same phase stepping, same Q15 coefficients.
+        let taps = TAPS_PER_PHASE;
+        let step = ((fin as f64 / fout as f64) * PHASE_ONE as f64).round() as u32;
+        let mut hist = [0.0f32; TAPS_PER_PHASE];
+        let mut pos = 0u32;
+        let mut want = Vec::new();
+        for &s in &input {
+            hist.copy_within(1..taps, 0);
+            hist[taps - 1] = s as f32;
+            while pos < PHASE_ONE {
+                let phase = (pos >> (PHASE_BITS - 8)) as usize;
+                let mut acc = 0.0f32;
+                for t in 0..taps {
+                    acc += hist[t] * (coeffs[phase * taps + t] as f32 / 32768.0);
+                }
+                want.push(acc.round().clamp(-32768.0, 32767.0) as i16);
+                pos += step;
+            }
+            pos -= PHASE_ONE;
+        }
+
+        assert_eq!(got.len(), want.len());
+        let se: f64 = got
+            .iter()
+            .zip(&want)
+            .map(|(&a, &b)| {
+                let d = a as f64 - b as f64;
+                d * d
+            })
+            .sum();
+        let sig: f64 = want.iter().map(|&b| (b as f64) * (b as f64)).sum();
+        let snr = 10.0 * (sig / se.max(1.0)).log10();
+        println!("Q15 vs f32-accumulator SNR = {:.1} dB", snr);
+        assert!(snr > 60.0, "integer core diverges from float: {:.1} dB", snr);
+    }
+
     /// `BoxedResampler` must produce byte-identical output to the borrowed
     /// `Resampler` fed the same coefficients, and survive being moved +
     /// reused across many calls (stable self-referential borrow).
@@ -550,7 +609,7 @@ mod tests {
             .collect();
 
         let expected = {
-            let mut coeffs = vec![0.0f32; COEFFS_LEN];
+            let mut coeffs = vec![0i16; COEFFS_LEN];
             let mut borrowed = Resampler::new(input_rate, output_rate, &mut coeffs).unwrap();
             borrowed.resample(&input)
         };
@@ -585,40 +644,6 @@ mod tests {
         assert!(
             BoxedResampler::new(48000, 0).is_err(),
             "zero output rate must error"
-        );
-    }
-}
-#[cfg(test)]
-mod debug_probe2 {
-    use super::*;
-
-    #[cfg(feature = "std")]
-    #[test]
-    fn probe_order() {
-        let input: Vec<i16> = (0..4800)
-            .map(|i| ((i as f32 * 0.05).sin() * 8000.0) as i16)
-            .collect();
-        // borrowed FIRST, then boxed — same order as the failing test
-        let expected = {
-            let mut coeffs = vec![0.0f32; COEFFS_LEN];
-            let mut r = Resampler::new(48000, 8000, &mut coeffs).unwrap();
-            r.resample(&input)
-        };
-        let mut boxed = BoxedResampler::new(48000, 8000).unwrap();
-        let got = boxed.resample(&input);
-        let diffs: Vec<usize> = expected
-            .iter()
-            .zip(got.iter())
-            .enumerate()
-            .filter(|(_, (a, b))| a != b)
-            .map(|(i, _)| i)
-            .collect();
-        println!(
-            "diff_count={} first_diffs={:?} expected_len={} got_len={}",
-            diffs.len(),
-            &diffs[..diffs.len().min(8)],
-            expected.len(),
-            got.len()
         );
     }
 }
