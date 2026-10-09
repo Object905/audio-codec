@@ -8,6 +8,7 @@ fn bench_codec(c: &mut Criterion) {
         CodecType::PCMU,
         CodecType::PCMA,
         CodecType::G722,
+        #[cfg(feature = "g729")]
         CodecType::G729,
         #[cfg(feature = "opus")]
         CodecType::Opus,

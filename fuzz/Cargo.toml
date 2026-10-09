@@ -13,7 +13,7 @@ arbitrary = { version = "1", features = ["derive"] }
 
 [dependencies.audio-codec]
 path = ".."
-features = ["opus"]
+features = ["opus", "g729"]
 
 [[bin]]
 name = "fuzz_target_1"

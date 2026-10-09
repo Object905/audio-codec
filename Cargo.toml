@@ -1,6 +1,6 @@
 [package]
 name = "audio-codec"
-version = "0.4.7"
+version = "0.4.8"
 edition = "2024"
 authors = ["jinti<shenjindi@fourz.cn>"]
 description = "A collection of VoIP audio codecs in pure Rust, including G.711, G.722, G.729, and Opus."
@@ -11,7 +11,7 @@ keywords = ["sip", "voip", "telephony", "webrtc", "no-std"]
 categories = ["multimedia", "no-std"]
 
 [features]
-default = ["std", "opus"]
+default = ["std", "opus", "g729"]
 # `std` enables the allocating convenience API (`encode`/`decode` returning
 # `Vec`, `create_encoder`/`create_decoder` returning `Box`, ...). Without it
 # the crate is `#![no_std]`; Opus then needs an `alloc` (its ~250 KB
@@ -22,16 +22,19 @@ default = ["std", "opus"]
 # the caller's stack. OpusEncoder's inline state is ~250 KB without it, so
 # `OpusEncoder::new` alone could consume most of an 8 MB thread stack —
 # fatal for deep async call chains in debug builds.
-std = ["g729-sys/std", "opus-rs?/std", "opus-rs?/heap"]
+std = ["g729-sys?/std", "opus-rs?/std", "opus-rs?/heap"]
 # Opus support. On by default. opus-rs uses `libm` for transcendentals when
 # `std` is off (no_std build).
 opus = ["dep:opus-rs", "opus-rs/libm"]
+# G.729 support. On by default. `g729-sys` is pure Rust and works without
+# `std`; disabling this feature drops the codec entirely (smaller build).
+g729 = ["dep:g729-sys"]
 
 [lib]
 crate-type = ["rlib"]
 
 [dependencies]
-g729-sys = { version = "0.2", default-features = false }
+g729-sys = { version = "0.2.1", optional = true, default-features = false }
 opus-rs = { version = "0.1.33", optional = true, default-features = false }
 libm = { version = "0.2", default-features = false }
 
@@ -43,3 +46,12 @@ opusic-sys = "0.7.3"
 [[bench]]
 name = "codec_bench"
 harness = false
+required-features = ["std"]
+
+[[example]]
+name = "wav_to_opus"
+required-features = ["std", "opus"]
+
+[[example]]
+name = "filetrack_test"
+required-features = ["std", "opus"]

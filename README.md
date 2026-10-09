@@ -8,7 +8,7 @@ A collection of VoIP audio codecs implemented for Rust. This crate provides a un
 |-------|----------------|---------|----------|
 | **G.711 (PCMA/PCMU)** | Pure Rust | Built-in | yes (heap-free) |
 | **G.722** | Pure Rust | Built-in | yes (heap-free) |
-| **G.729** | Pure Rust (`g729-sys`) | Built-in | yes (heap-free) |
+| **G.729** | Pure Rust (`g729-sys`) | `g729` (on by default) | yes (heap-free) |
 | **Opus** | Pure Rust (`opus-rs`) | `opus` (on by default) | yes (needs `alloc`) |
 | **Telephone Event** | RFC 4733 | Built-in | yes (heap-free) |
 | **Resampler** | Polyphase FIR | Built-in | yes (heap-free) |
@@ -41,14 +41,23 @@ Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-audio-codec = "0.4"   # Opus is enabled by default
+audio-codec = "0.4"   # Opus and G.729 are enabled by default
 ```
 
-To opt out of Opus (smaller build, no `alloc` needed):
+To opt out of Opus and G.729 (smaller build, no `alloc` needed):
 
 ```toml
 [dependencies]
 audio-codec = { version = "0.4", default-features = false, features = ["std"] }
+```
+
+Opt out of only one of them by keeping the default features and disabling
+the one you don't need:
+
+```toml
+[dependencies]
+audio-codec = { version = "0.4", default-features = false, features = ["std", "g729"] }  # no Opus
+audio-codec = { version = "0.4", default-features = false, features = ["std", "opus"] }  # no G.729
 ```
 
 ### Example: Decoding PCMA

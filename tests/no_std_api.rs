@@ -3,9 +3,10 @@
 //! These tests exercise the same code paths that bare-metal users hit when
 //! they call `encode_into`/`decode_into`/`resample_into` directly.
 
+#[cfg(feature = "g729")]
+use audio_codec::g729;
 use audio_codec::{
-    CodecError, Decoder, Encoder, bytes_to_samples_into, g722, g729, pcma, pcmu,
-    samples_to_bytes_into,
+    CodecError, Decoder, Encoder, bytes_to_samples_into, g722, pcma, pcmu, samples_to_bytes_into,
 };
 
 /// Like `roundtrip` but tolerates quantization error (for lossy codecs).
@@ -110,6 +111,7 @@ fn test_g722_max_sizes_are_correct() {
     assert_eq!(dec.max_decode_samples(160), 320); // n*2
 }
 
+#[cfg(feature = "g729")]
 #[test]
 fn test_g729_into_roundtrip() {
     // G.729 8kHz, 80 samples = 10ms frame, encoded to 10 bytes.
