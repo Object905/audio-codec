@@ -248,6 +248,19 @@ impl<'a> Resampler<'a> {
         // at every possible early exit, a local can stay in a register.
         let (step, interval) = (self.input_rate, self.output_rate);
         let mut pos = self.pos;
+        // Exact number of outputs this call must produce: outputs sit `step`
+        // ticks apart starting at `pos`, and the call consumes
+        // `input.len() * interval` ticks. Anything else means output sizes
+        // drift across chunk boundaries (the 0.4.8 bug: 20 ms frames came out
+        // with 959/961 samples). Pinned by `debug_assert_eq!` below.
+        let expected: u128 = {
+            let ticks = (input.len() as u128) * (interval as u128);
+            if ticks > pos as u128 {
+                (ticks - pos as u128).div_ceil(step as u128)
+            } else {
+                0
+            }
+        };
 
         for &sample in input {
             // Compact the double buffer only once per `taps` inputs.
@@ -261,9 +274,8 @@ impl<'a> Resampler<'a> {
             // Emit every output that falls before the next input sample.
             if pos < interval {
                 let base = self.w - taps;
-                let win: &[i16; TAPS_PER_PHASE] = self.history[base..base + taps]
-                    .try_into()
-                    .unwrap();
+                let win: &[i16; TAPS_PER_PHASE] =
+                    self.history[base..base + taps].try_into().unwrap();
 
                 while pos < interval {
                     // Where the output falls between two input samples picks
@@ -287,6 +299,21 @@ impl<'a> Resampler<'a> {
         }
         self.pos = pos;
 
+        // The tick-grid timing is exact by construction; this assert pins it
+        // so a future change to the stepping can never silently reintroduce
+        // wrong frame sizes (debug builds and tests only; free in release).
+        debug_assert_eq!(
+            written as u128,
+            expected,
+            "resampler produced {written} samples, exact timing requires {expected} \
+             for {} inputs ({input_rate} -> {output_rate} at pos {}): output \
+             sizes would drift across chunk boundaries",
+            input.len(),
+            self.pos,
+            input_rate = self.input_rate,
+            output_rate = self.output_rate,
+        );
+
         Ok(written)
     }
 
@@ -309,10 +336,25 @@ impl<'a> Resampler<'a> {
         let mut out = vec![0i16; max];
         match self.resample_into(input, &mut out) {
             Ok(n) => {
+                debug_assert!(
+                    n <= max,
+                    "resampler emitted {n} samples but `max_output_samples` \
+                     said {max}; buffer sizing invariant broken"
+                );
                 out.truncate(n);
                 out
             }
-            Err(_) => Vec::new(),
+            Err(e) => {
+                // Unreachable while the buffer is sized by
+                // `max_output_samples` (an exact upper bound). Panic in debug
+                // builds and tests so a sizing/count regression can never
+                // silently turn into empty (e.g. Opus) frames; release keeps
+                // the documented empty-vec-on-error behaviour.
+                if cfg!(debug_assertions) {
+                    panic!("resample_into failed inside `resample`: {e:?}");
+                }
+                Vec::new()
+            }
         }
     }
 
@@ -432,7 +474,11 @@ mod tests {
                     let n = r.resample_into(&input, &mut output).unwrap_or_else(|e| {
                         panic!("{input_rate} -> {output_rate}, block {block}: {e:?}")
                     });
-                    assert_eq!(n, output.len(), "{input_rate} -> {output_rate}, block {block}");
+                    assert_eq!(
+                        n,
+                        output.len(),
+                        "{input_rate} -> {output_rate}, block {block}"
+                    );
                 }
             }
         }
@@ -453,16 +499,28 @@ mod tests {
                 expected.len(),
                 (input.len() * output_rate).div_ceil(input_rate)
             );
-            r.reset();
-            let mut got = Vec::new();
-            let mut consumed = 0;
-            for chunk in input.chunks(7) {
-                got.extend(r.resample(chunk));
-                consumed += chunk.len();
-                assert_eq!(got.len(), (consumed * output_rate).div_ceil(input_rate));
-                assert!(r.resample(&[]).is_empty());
+            // Sweep chunk sizes around the history length (24) so every
+            // phase-accumulator alignment is exercised: the running output
+            // count must always be exactly ceil(consumed * out / in).
+            for chunk_size in [1, 2, 3, 5, 7, 11, 23, 24, 25, 47, 88, 160, 319] {
+                r.reset();
+                let mut got = Vec::new();
+                let mut consumed = 0;
+                for chunk in input.chunks(chunk_size) {
+                    got.extend(r.resample(chunk));
+                    consumed += chunk.len();
+                    assert_eq!(
+                        got.len(),
+                        (consumed * output_rate).div_ceil(input_rate),
+                        "{input_rate} -> {output_rate}, chunk {chunk_size}, consumed {consumed}"
+                    );
+                    assert!(r.resample(&[]).is_empty());
+                }
+                assert_eq!(
+                    got, expected,
+                    "{input_rate} -> {output_rate}, chunk {chunk_size}"
+                );
             }
-            assert_eq!(got, expected, "{input_rate} -> {output_rate}");
             r.reset();
             assert_eq!(r.resample(&input), expected);
         }
@@ -630,7 +688,9 @@ mod tests {
         let mut coeffs = vec![0i16; COEFFS_LEN];
         let mut r = Resampler::new(fin, fout, &mut coeffs).unwrap();
 
-        let input: Vec<i16> = (0..2000).map(|i| (((i * 37) % 200 - 100) * 60) as i16).collect();
+        let input: Vec<i16> = (0..2000)
+            .map(|i| (((i * 37) % 200 - 100) * 60) as i16)
+            .collect();
         let got = r.resample(&input);
 
         // f32 reference: derive positions from the absolute output index,
@@ -663,7 +723,11 @@ mod tests {
         let sig: f64 = want.iter().map(|&b| (b as f64) * (b as f64)).sum();
         let snr = 10.0 * (sig / se.max(1.0)).log10();
         println!("Q15 vs f32-accumulator SNR = {:.1} dB", snr);
-        assert!(snr > 60.0, "integer core diverges from float: {:.1} dB", snr);
+        assert!(
+            snr > 60.0,
+            "integer core diverges from float: {:.1} dB",
+            snr
+        );
     }
 
     /// `BoxedResampler` must produce byte-identical output to the borrowed
