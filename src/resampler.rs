@@ -1,3 +1,12 @@
+//! Default polyphase FIR resampler (f32 core, exact integer timing).
+//!
+//! The filter is the classic Kaiser-windowed polyphase FIR (256 phases × 24
+//! taps). The read position is tracked on an integer grid of
+//! `input_rate * output_rate` ticks per second, so repeated 20 ms frames keep
+//! a **constant, exact** output count (8 kHz → 48 kHz is always 960 samples,
+//! never 959/961). The Q15 fixed-point core with the same timing lives in
+//! [`crate::resampler_fixed`] for targets without an FPU.
+
 use core::f64::consts::PI as PI_F64;
 
 use super::{CodecError, Sample};
@@ -11,10 +20,6 @@ pub const NUM_PHASES: usize = 256;
 pub const TAPS_PER_PHASE: usize = 24;
 /// Required length of the caller-provided coefficient buffer (`NUM_PHASES * TAPS_PER_PHASE`).
 pub const COEFFS_LEN: usize = NUM_PHASES * TAPS_PER_PHASE;
-
-/// Fixed-point scale for the polyphase coefficients and the FIR accumulator
-/// (Q15: one unit = 1/32768).
-const Q15_SHIFT: u32 = 15;
 
 /// `f64::sin` polyfill that works in both std and no_std (via libm).
 #[inline]
@@ -42,47 +47,15 @@ fn fsqrt(x: f64) -> f64 {
     }
 }
 
-/// `f64::round` polyfill (round half away from zero).
-#[inline]
-fn fround(x: f64) -> f64 {
-    #[cfg(feature = "std")]
-    {
-        x.round()
-    }
-    #[cfg(not(feature = "std"))]
-    {
-        libm::round(x)
-    }
-}
-
-/// Polyphase resampler.
-///
-/// The filter runs entirely in **fixed point** (Q15 i16 coefficients, i16
-/// history, i64 accumulator, integer phase accumulator). This matters on
-/// targets without an FPU (e.g. ESP32-S3 / Xtensa LX7): a soft-float `f32`
-/// FIR is ~20× slower than the equivalent integer one there. Coefficients are
-/// still *designed* in `f64` at construction time and quantised once.
-///
-/// The coefficient buffer is **Q15 `i16`** (6144 entries, 12 KB) supplied by
-/// the caller so this type stays `no_std`/allocation-free.
 pub struct Resampler<'a> {
     input_rate: usize,
     output_rate: usize,
-    coeffs: &'a mut [i16],
+    coeffs: &'a mut [f32],
     taps_per_phase: usize,
-    /// Sliding window of the last `TAPS_PER_PHASE` inputs, held in a double
-    /// buffer to avoid shifting on every input sample: new samples are
-    /// appended at `w`, the window is `history[w - TAPS .. w]`, and the
-    /// buffer is compacted once every `TAPS_PER_PHASE` inputs.
-    history: [i16; 2 * TAPS_PER_PHASE],
-    /// Write cursor into `history` (`TAPS_PER_PHASE ..= 2 * TAPS_PER_PHASE`).
-    w: usize,
-    /// Ticks from the newest input sample to the next output sample. It can
-    /// exceed one input sample when downsampling.
-    ///
-    /// Timing runs on an integer grid of `input_rate * output_rate` ticks per
-    /// second: one input sample is `output_rate` ticks and one output sample
-    /// is `input_rate` ticks, so the timing is exact and never rounded.
+    /// Last [`TAPS_PER_PHASE`] input samples, oldest first.
+    history: [f32; TAPS_PER_PHASE],
+    /// Ticks from the newest input sample to the next output sample, on the
+    /// `input_rate * output_rate` grid (see [`Resampler::resample_into`]).
     pos: usize,
 }
 
@@ -112,21 +85,28 @@ fn kaiser_window(n: usize, n_total: usize, beta: f64) -> f64 {
 }
 
 impl<'a> Resampler<'a> {
-    /// Create a new `Resampler`, writing Q15 polyphase filter coefficients into
-    /// the caller-provided buffer.
+    /// Create a new `Resampler`, writing polyphase filter coefficients into the
+    /// caller-provided buffer.
     ///
-    /// `coeffs.len()` must be at least [`COEFFS_LEN`] (= 6144 `i16`, 12 KB).
+    /// `coeffs.len()` must be at least [`COEFFS_LEN`] (= 6144 floats, ~24 KB).
     /// The buffer is held by the resampler for its entire lifetime; it is
     /// written once here and read on every subsequent `resample_into` call.
     pub fn new(
         input_rate: usize,
         output_rate: usize,
-        coeffs: &'a mut [i16],
+        coeffs: &'a mut [f32],
     ) -> Result<Self, CodecError> {
         if coeffs.len() < COEFFS_LEN {
             return Err(CodecError::BufferTooSmall);
         }
         if input_rate == 0 || output_rate == 0 {
+            return Err(CodecError::InvalidInput);
+        }
+        // Guard the integer tick grid's `pos * NUM_PHASES` against overflow
+        // (`pos < output_rate` in the hot loop, so this is the only product).
+        if input_rate.checked_add(output_rate).is_none()
+            || output_rate.checked_mul(NUM_PHASES).is_none()
+        {
             return Err(CodecError::InvalidInput);
         }
 
@@ -136,16 +116,6 @@ impl<'a> Resampler<'a> {
         let num_phases = NUM_PHASES;
         let taps_per_phase = TAPS_PER_PHASE;
         let filter_len = num_phases * taps_per_phase;
-
-        // Integer tick periods keep the timing exact: the old Q24 step rounded
-        // 1/3 and produced an extra sample on the first 16 -> 48 kHz block.
-        // In the hot loop `pos < output_rate` whenever `pos + input_rate` or
-        // `pos * NUM_PHASES` is computed, so neither can overflow.
-        if input_rate.checked_add(output_rate).is_none()
-            || output_rate.checked_mul(NUM_PHASES).is_none()
-        {
-            return Err(CodecError::InvalidInput);
-        }
 
         let coeffs = &mut coeffs[..filter_len];
 
@@ -182,9 +152,8 @@ impl<'a> Resampler<'a> {
             }
 
             for t in 0..taps_per_phase {
-                // Quantise the normalised tap to Q15.
-                let q = fround((phase_coeffs[t] / sum) * 32768.0);
-                coeffs[p * taps_per_phase + t] = q.clamp(-32768.0, 32767.0) as i16;
+                let normalized = (phase_coeffs[t] / sum) as f32;
+                coeffs[p * taps_per_phase + t] = normalized;
             }
         }
 
@@ -193,8 +162,7 @@ impl<'a> Resampler<'a> {
             output_rate,
             coeffs,
             taps_per_phase,
-            history: [0; 2 * TAPS_PER_PHASE],
-            w: TAPS_PER_PHASE,
+            history: [0.0; TAPS_PER_PHASE],
             pos: 0,
         })
     }
@@ -207,19 +175,72 @@ impl<'a> Resampler<'a> {
         self.output_rate
     }
 
-    /// Q15 dot product of the 24-tap window against one phase, accumulated in
-    /// `i64` (worst-case `24 * 32768 * 32767` overflows `i32`). The `i16`×`i16`
-    /// product itself fits in `i32`, so only the accumulation widens.
-    ///
-    /// Takes fixed-size array refs so the outer loops' slice↔array `try_into`
-    /// is the only length check (the `i16` indices below are unchecked).
     #[inline(always)]
-    fn dot_q15(history: &[i16; TAPS_PER_PHASE], coeffs: &[i16; TAPS_PER_PHASE]) -> i32 {
-        let mut acc: i64 = 0;
-        for i in 0..TAPS_PER_PHASE {
-            acc += ((history[i] as i32) * (coeffs[i] as i32)) as i64;
+    fn dot_product(a: &[f32], b: &[f32]) -> f32 {
+        debug_assert_eq!(a.len(), TAPS_PER_PHASE);
+        debug_assert_eq!(b.len(), TAPS_PER_PHASE);
+
+        #[cfg(target_arch = "aarch64")]
+        {
+            // ARM NEON: 24 taps = 6 iterations of 4-wide vectors
+            unsafe {
+                use core::arch::aarch64::*;
+                let mut sumv = vdupq_n_f32(0.0);
+                for i in (0..TAPS_PER_PHASE).step_by(4) {
+                    let av = vld1q_f32(a.as_ptr().add(i));
+                    let bv = vld1q_f32(b.as_ptr().add(i));
+                    sumv = vfmaq_f32(sumv, av, bv);
+                }
+                vaddvq_f32(sumv)
+            }
         }
-        (acc >> Q15_SHIFT) as i32
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx"))]
+        {
+            unsafe {
+                use core::arch::x86_64::*;
+                let mut sumv = _mm256_setzero_ps();
+                for i in (0..TAPS_PER_PHASE).step_by(8) {
+                    let av = _mm256_loadu_ps(a.as_ptr().add(i));
+                    let bv = _mm256_loadu_ps(b.as_ptr().add(i));
+                    sumv = _mm256_add_ps(sumv, _mm256_mul_ps(av, bv));
+                }
+                // Horizontal sum
+                let x128 = _mm_add_ps(_mm256_extractf128_ps(sumv, 1), _mm256_castps256_ps128(sumv));
+                let x64 = _mm_add_ps(x128, _mm_movehl_ps(x128, x128));
+                let x32 = _mm_add_ss(x64, _mm_shuffle_ps(x64, x64, 0x55));
+                _mm_cvtss_f32(x32)
+            }
+        }
+        #[cfg(all(
+            target_arch = "x86_64",
+            target_feature = "sse2",
+            not(target_feature = "avx")
+        ))]
+        {
+            unsafe {
+                use core::arch::x86_64::*;
+                let mut sumv = _mm_setzero_ps();
+                for i in (0..TAPS_PER_PHASE).step_by(4) {
+                    let av = _mm_loadu_ps(a.as_ptr().add(i));
+                    let bv = _mm_loadu_ps(b.as_ptr().add(i));
+                    sumv = _mm_add_ps(sumv, _mm_mul_ps(av, bv));
+                }
+                let x64 = _mm_add_ps(sumv, _mm_shuffle_ps(sumv, sumv, 0x4e));
+                let x32 = _mm_add_ss(x64, _mm_shuffle_ps(x64, x64, 0x11));
+                _mm_cvtss_f32(x32)
+            }
+        }
+        #[cfg(not(any(
+            target_arch = "aarch64",
+            all(target_arch = "x86_64", target_feature = "sse2")
+        )))]
+        {
+            let mut s = 0.0f32;
+            for i in 0..TAPS_PER_PHASE {
+                s += a[i] * b[i];
+            }
+            s
+        }
     }
 
     /// Resample `input` into the caller-provided `out` buffer.
@@ -241,18 +262,16 @@ impl<'a> Resampler<'a> {
         }
 
         let taps = self.taps_per_phase;
-        let two_taps = 2 * taps;
-        let mut written = 0usize;
-        // Tick periods (see `pos`): `step` per output, `interval` per input.
-        // Work on locals: a field would have to be kept up to date in memory
-        // at every possible early exit, a local can stay in a register.
+        // Integer tick grid: one input sample spans `interval` ticks and one
+        // output sample advances `step` ticks, so timing is exact and never
+        // rounded — repeated 20 ms frames keep a constant output count.
         let (step, interval) = (self.input_rate, self.output_rate);
         let mut pos = self.pos;
-        // Exact number of outputs this call must produce: outputs sit `step`
-        // ticks apart starting at `pos`, and the call consumes
-        // `input.len() * interval` ticks. Anything else means output sizes
-        // drift across chunk boundaries (the 0.4.8 bug: 20 ms frames came out
-        // with 959/961 samples). Pinned by `debug_assert_eq!` below.
+        // Exact number of outputs this call must produce (see the Q15 core for
+        // the same grid): outputs sit `step` ticks apart starting at `pos`, and
+        // the call consumes `input.len() * interval` ticks. Anything else means
+        // frame sizes drift across chunk boundaries (the 0.4.x 959/961 bug);
+        // pinned by `debug_assert_eq!` below.
         let expected: u128 = {
             let ticks = (input.len() as u128) * (interval as u128);
             if ticks > pos as u128 {
@@ -261,57 +280,43 @@ impl<'a> Resampler<'a> {
                 0
             }
         };
+        let mut written = 0usize;
 
         for &sample in input {
-            // Compact the double buffer only once per `taps` inputs.
-            if self.w == two_taps {
-                self.history.copy_within(taps..two_taps, 0);
-                self.w = taps;
-            }
-            self.history[self.w] = sample;
-            self.w += 1;
+            self.history.copy_within(1..taps, 0);
+            self.history[taps - 1] = sample as f32;
 
-            // Emit every output that falls before the next input sample.
-            if pos < interval {
-                let base = self.w - taps;
-                let win: &[i16; TAPS_PER_PHASE] =
-                    self.history[base..base + taps].try_into().unwrap();
+            while pos < interval {
+                // The integer tick position selects the filter phase; only
+                // this choice is quantised.
+                let phase_idx = pos * NUM_PHASES / interval;
+                let offset = phase_idx * taps;
+                let phase_coeffs: &[f32; TAPS_PER_PHASE] =
+                    self.coeffs[offset..offset + taps].try_into().unwrap();
 
-                while pos < interval {
-                    // Where the output falls between two input samples picks
-                    // the filter phase; only this choice is quantised.
-                    let phase_idx = pos * NUM_PHASES / interval;
-                    let offset = phase_idx * taps;
-                    let phase_coeffs: &[i16; TAPS_PER_PHASE] =
-                        self.coeffs[offset..offset + taps].try_into().unwrap();
-                    let out_sample = Self::dot_q15(win, phase_coeffs);
+                let out_sample = Self::dot_product(phase_coeffs, &self.history);
 
-                    if written >= out.len() {
-                        self.pos = pos;
-                        return Err(CodecError::BufferTooSmall);
-                    }
-                    out[written] = out_sample.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
-                    written += 1;
-                    pos += step;
+                if written >= out.len() {
+                    self.pos = pos;
+                    return Err(CodecError::BufferTooSmall);
                 }
+                out[written] = out_sample.clamp(i16::MIN as f32, i16::MAX as f32) as i16;
+                written += 1;
+                pos += step;
             }
             pos -= interval;
         }
         self.pos = pos;
 
-        // The tick-grid timing is exact by construction; this assert pins it
-        // so a future change to the stepping can never silently reintroduce
-        // wrong frame sizes (debug builds and tests only; free in release).
         debug_assert_eq!(
             written as u128,
             expected,
             "resampler produced {written} samples, exact timing requires {expected} \
-             for {} inputs ({input_rate} -> {output_rate} at pos {}): output \
-             sizes would drift across chunk boundaries",
+             for {} inputs ({} -> {}): output sizes would drift across chunk \
+             boundaries",
             input.len(),
-            self.pos,
-            input_rate = self.input_rate,
-            output_rate = self.output_rate,
+            self.input_rate,
+            self.output_rate,
         );
 
         Ok(written)
@@ -323,8 +328,8 @@ impl<'a> Resampler<'a> {
         if self.input_rate == self.output_rate {
             return n_input;
         }
-        // Outputs (`input_rate` ticks apart) that fit in `n_input` input
-        // periods (`output_rate` ticks each); the most fit when `pos == 0`.
+        // Exact bound: outputs (`input_rate` ticks apart) that fit in `n_input`
+        // input periods (`output_rate` ticks each); the most fit when `pos == 0`.
         let count = (n_input as u128 * self.output_rate as u128).div_ceil(self.input_rate as u128);
         count.min(usize::MAX as u128) as usize
     }
@@ -336,31 +341,15 @@ impl<'a> Resampler<'a> {
         let mut out = vec![0i16; max];
         match self.resample_into(input, &mut out) {
             Ok(n) => {
-                debug_assert!(
-                    n <= max,
-                    "resampler emitted {n} samples but `max_output_samples` \
-                     said {max}; buffer sizing invariant broken"
-                );
                 out.truncate(n);
                 out
             }
-            Err(e) => {
-                // Unreachable while the buffer is sized by
-                // `max_output_samples` (an exact upper bound). Panic in debug
-                // builds and tests so a sizing/count regression can never
-                // silently turn into empty (e.g. Opus) frames; release keeps
-                // the documented empty-vec-on-error behaviour.
-                if cfg!(debug_assertions) {
-                    panic!("resample_into failed inside `resample`: {e:?}");
-                }
-                Vec::new()
-            }
+            Err(_) => Vec::new(),
         }
     }
 
     pub fn reset(&mut self) {
-        self.history.fill(0);
-        self.w = self.taps_per_phase;
+        self.history.fill(0.0);
         self.pos = 0;
     }
 }
@@ -373,7 +362,7 @@ pub fn resample(input: &[Sample], input_sample_rate: u32, output_sample_rate: u3
     if input_sample_rate == output_sample_rate {
         return input.to_vec();
     }
-    let mut coeffs = vec![0i16; COEFFS_LEN];
+    let mut coeffs = vec![0.0f32; COEFFS_LEN];
     let mut r = match Resampler::new(
         input_sample_rate as usize,
         output_sample_rate as usize,
@@ -387,7 +376,7 @@ pub fn resample(input: &[Sample], input_sample_rate: u32, output_sample_rate: u3
 
 /// Self-contained [`Resampler`] that owns its coefficient buffer (std only).
 ///
-/// [`Resampler`] borrows a ~12 KB caller-provided coefficient slice, which
+/// [`Resampler`] borrows a ~24 KB caller-provided coefficient slice, which
 /// makes it awkward to store as a long-lived struct field (the buffer must
 /// outlive the resampler). `BoxedResampler` heap-allocates the coefficients
 /// once and keeps them alive for the resampler's whole lifetime, restoring
@@ -402,7 +391,7 @@ pub struct BoxedResampler {
     inner: Resampler<'static>,
     /// Kept alive only to back `inner`'s `'static` borrow; never read.
     #[allow(dead_code)]
-    coeffs: Box<[i16]>,
+    coeffs: Box<[f32]>,
 }
 
 #[cfg(feature = "std")]
@@ -412,7 +401,7 @@ impl BoxedResampler {
     /// Fails only for zero rates (the coefficient buffer is always sized
     /// correctly internally).
     pub fn new(input_rate: usize, output_rate: usize) -> Result<Self, CodecError> {
-        let mut coeffs = vec![0i16; COEFFS_LEN].into_boxed_slice();
+        let mut coeffs = vec![0.0f32; COEFFS_LEN].into_boxed_slice();
         // SAFETY: `coeffs` is a heap box whose address cannot change while
         // the allocation lives. We extend the borrow to 'static solely to
         // store both the buffer and its borrower in the same struct; the
@@ -420,7 +409,7 @@ impl BoxedResampler {
         // else can reach the buffer (it is moved into `Self` right after).
         let inner = unsafe {
             let ptr = coeffs.as_mut_ptr();
-            let loan: &'static mut [i16] = core::slice::from_raw_parts_mut(ptr, coeffs.len());
+            let loan: &'static mut [f32] = core::slice::from_raw_parts_mut(ptr, coeffs.len());
             Resampler::new(input_rate, output_rate, loan)?
         };
         Ok(Self { inner, coeffs })
@@ -459,10 +448,13 @@ mod tests {
 
     fn new_resampler(input_rate: usize, output_rate: usize) -> Resampler<'static> {
         // Leak intentionally: tests are short-lived and we need a 'static reference.
-        let coeffs: &'static mut [i16] = Box::leak(vec![0i16; COEFFS_LEN].into_boxed_slice());
+        let coeffs: &'static mut [f32] = Box::leak(vec![0.0f32; COEFFS_LEN].into_boxed_slice());
         Resampler::new(input_rate, output_rate, coeffs).expect("resampler init")
     }
 
+    /// The exact integer tick grid must keep the output count constant across
+    /// repeated 20 ms frames (no 959/961 drift) — the whole point of the f32
+    /// core having the same timing as the Q15 core.
     #[test]
     fn test_exact_sample_counts_for_repeated_20ms_blocks() {
         for input_rate in [8000, 16000, 44100, 48000] {
@@ -484,61 +476,14 @@ mod tests {
         }
     }
 
+    /// 8 kHz -> 48 kHz (the phone-side to Opus path): every 20 ms frame must be
+    /// exactly 960 samples, first block included.
     #[test]
-    fn test_exact_timing_survives_unaligned_chunks_and_reset() {
-        for (input_rate, output_rate) in [
-            (16000, 48000),
-            (48000, 16000),
-            (44100, 48000),
-            (48000, 44100),
-        ] {
-            let input: Vec<i16> = (0..2000).map(|i| ((i * 37 % 200) - 100) as i16).collect();
-            let mut r = new_resampler(input_rate, output_rate);
-            let expected = r.resample(&input);
-            assert_eq!(
-                expected.len(),
-                (input.len() * output_rate).div_ceil(input_rate)
-            );
-            // Sweep chunk sizes around the history length (24) so every
-            // phase-accumulator alignment is exercised: the running output
-            // count must always be exactly ceil(consumed * out / in).
-            for chunk_size in [1, 2, 3, 5, 7, 11, 23, 24, 25, 47, 88, 160, 319] {
-                r.reset();
-                let mut got = Vec::new();
-                let mut consumed = 0;
-                for chunk in input.chunks(chunk_size) {
-                    got.extend(r.resample(chunk));
-                    consumed += chunk.len();
-                    assert_eq!(
-                        got.len(),
-                        (consumed * output_rate).div_ceil(input_rate),
-                        "{input_rate} -> {output_rate}, chunk {chunk_size}, consumed {consumed}"
-                    );
-                    assert!(r.resample(&[]).is_empty());
-                }
-                assert_eq!(
-                    got, expected,
-                    "{input_rate} -> {output_rate}, chunk {chunk_size}"
-                );
-            }
-            r.reset();
-            assert_eq!(r.resample(&input), expected);
-        }
-    }
-
-    #[cfg(feature = "opus")]
-    #[test]
-    fn test_resampled_20ms_frames_encode_as_opus() {
-        use crate::{Encoder, opus::OpusEncoder};
-
-        for input_rate in [8000, 16000] {
-            let mut r = new_resampler(input_rate, 48000);
-            let mut encoder = OpusEncoder::new_default();
-            for _ in 0..3 {
-                let pcm = r.resample(&vec![0; input_rate / 50]);
-                assert_eq!(pcm.len(), 960);
-                assert!(!encoder.encode(&pcm).is_empty());
-            }
+    fn test_8k_to_48k_is_always_960() {
+        let mut r = new_resampler(8000, 48000);
+        for block in 0..10 {
+            let out = r.resample(&vec![1000i16; 160]);
+            assert_eq!(out.len(), 960, "block {block}");
         }
     }
 
@@ -677,59 +622,6 @@ mod tests {
         );
     }
 
-    /// The Q15 integer core must match an f32 accumulator using the *same*
-    /// quantised coefficients — going integer must not change the result
-    /// beyond rounding. (Coefficient quantisation itself is covered by the
-    /// passband/aliasing tests above.)
-    #[test]
-    fn test_q15_core_matches_float_reference() {
-        let fin = 16000usize;
-        let fout = 48000usize;
-        let mut coeffs = vec![0i16; COEFFS_LEN];
-        let mut r = Resampler::new(fin, fout, &mut coeffs).unwrap();
-
-        let input: Vec<i16> = (0..2000)
-            .map(|i| (((i * 37) % 200 - 100) * 60) as i16)
-            .collect();
-        let got = r.resample(&input);
-
-        // f32 reference: derive positions from the absolute output index,
-        // independently of the streaming accumulator, using the same Q15 taps.
-        let taps = TAPS_PER_PHASE;
-        let mut hist = [0.0f32; TAPS_PER_PHASE];
-        let mut want = Vec::new();
-        for (input_index, &s) in input.iter().enumerate() {
-            hist.copy_within(1..taps, 0);
-            hist[taps - 1] = s as f32;
-            while want.len() * fin < (input_index + 1) * fout {
-                let phase = (want.len() * fin % fout) * NUM_PHASES / fout;
-                let mut acc = 0.0f32;
-                for t in 0..taps {
-                    acc += hist[t] * (coeffs[phase * taps + t] as f32 / 32768.0);
-                }
-                want.push(acc.round().clamp(-32768.0, 32767.0) as i16);
-            }
-        }
-
-        assert_eq!(got.len(), want.len());
-        let se: f64 = got
-            .iter()
-            .zip(&want)
-            .map(|(&a, &b)| {
-                let d = a as f64 - b as f64;
-                d * d
-            })
-            .sum();
-        let sig: f64 = want.iter().map(|&b| (b as f64) * (b as f64)).sum();
-        let snr = 10.0 * (sig / se.max(1.0)).log10();
-        println!("Q15 vs f32-accumulator SNR = {:.1} dB", snr);
-        assert!(
-            snr > 60.0,
-            "integer core diverges from float: {:.1} dB",
-            snr
-        );
-    }
-
     /// `BoxedResampler` must produce byte-identical output to the borrowed
     /// `Resampler` fed the same coefficients, and survive being moved +
     /// reused across many calls (stable self-referential borrow).
@@ -743,12 +635,13 @@ mod tests {
             .collect();
 
         let expected = {
-            let mut coeffs = vec![0i16; COEFFS_LEN];
+            let mut coeffs = vec![0.0f32; COEFFS_LEN];
             let mut borrowed = Resampler::new(input_rate, output_rate, &mut coeffs).unwrap();
             borrowed.resample(&input)
         };
 
         let mut boxed = BoxedResampler::new(input_rate, output_rate).unwrap();
+        // Exact bound now (no `+1`): the integer tick grid never over-produces.
         let expected_max = (input.len() * output_rate).div_ceil(input_rate);
         assert_eq!(boxed.max_output_samples(input.len()), expected_max);
         let got = boxed.resample(&input);

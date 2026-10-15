@@ -15,7 +15,11 @@ pub mod g729;
 pub mod opus;
 pub mod pcma;
 pub mod pcmu;
+/// Default polyphase resampler (f32 core, exact integer timing).
 pub mod resampler;
+/// Alternative polyphase resampler with a Q15 fixed-point core, for targets
+/// without an FPU. Not the default; use [`resampler`] unless you need it.
+pub mod resampler_fixed;
 pub mod telephone_event;
 
 #[cfg(feature = "std")]

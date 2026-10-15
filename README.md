@@ -151,7 +151,10 @@ let needed_samples = decoder.max_decode_samples(n_bytes);
 
 ### Resampler in `no_std`
 
-`Resampler` borrows a caller-provided coefficient buffer (~24 KB):
+`Resampler` borrows a caller-provided coefficient buffer (~24 KB). The default
+`f32` core tracks the read position on an exact integer tick grid, so repeated
+20 ms frames keep a **constant** output count (8 kHz → 48 kHz is always 960
+samples, never 959/961):
 
 ```rust
 use audio_codec::resampler::{Resampler, COEFFS_LEN};
@@ -162,6 +165,12 @@ let mut r = Resampler::new(8000, 16000, &mut coeffs)?;
 let mut out = [0i16; 160];
 let n = r.resample_into(&input[..80], &mut out)?;
 ```
+
+This is the default `f32` polyphase core. Targets without an FPU (e.g.
+ESP32-S3) can use the Q15 fixed-point core instead via
+`audio_codec::resampler_fixed` — it borrows `i16` coefficients
+(`COEFFS_LEN` = 6144, 12 KB) and is ~20× faster where soft-float is used,
+but it is **not** the default.
 
 ### Opus in `no_std`
 
