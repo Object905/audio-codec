@@ -32,9 +32,12 @@ const fn linear2ulaw_algo(mut sample: i16) -> u8 {
     let uval = if segment >= 8 {
         0x7F ^ sign
     } else {
-        let shift = if segment == 0 { 7 } else { segment + 3 };
-        let mask = 0xFF ^ (0xFF >> shift);
-        (sign | (segment << 4) | ((sample >> (segment + 3)) & 0x0F)) ^ mask
+        // Standard G.711 µ-law complements the whole byte:
+        //   ulawbyte = ~(sign | (segment << 4) | mantissa)
+        // A previous version XOR'd with a partial mask
+        // (0xFF ^ (0xFF >> shift)), leaving the low bits un-complemented and
+        // producing non-standard codes for ~12% of inputs.
+        (sign | (segment << 4) | ((sample >> (segment + 3)) & 0x0F)) ^ 0xFF
     };
 
     uval as u8

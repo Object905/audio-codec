@@ -137,6 +137,61 @@ fn g711_roundtrip_error_stays_bounded() {
     assert!(a_err <= 1024, "A-law max abs error {a_err} too large");
 }
 
+/// The G.711 µ-law encoder must match the canonical ITU-T / Sun `g711.c`
+/// algorithm for every 16-bit input.
+///
+/// Regression guard: an earlier version XOR'd with a partial mask
+/// (`0xFF ^ (0xFF >> shift)`) instead of complementing the whole byte, emitting
+/// non-standard codes for ~12% of inputs. Decoded by any standard G.711
+/// decoder (media players, peers) that added ~6 dB of audible quantization
+/// noise ("hiss") to recordings.
+#[test]
+fn pcmu_encoder_matches_canonical_g711() {
+    /// Canonical linear -> µ-law (ITU-T G.711 / Sun g711.c).
+    fn canonical_ulaw(mut sample: i16) -> u8 {
+        const BIAS: i32 = 0x84;
+        const CLIP: i16 = 32635;
+        if sample > CLIP {
+            sample = CLIP;
+        } else if sample < -CLIP {
+            sample = -CLIP;
+        }
+        let sign: u8 = if sample < 0 { 0x80 } else { 0x00 };
+        if sample < 0 {
+            sample = -sample;
+        }
+        let s = sample as i32 + BIAS;
+        // exp_lut[(s >> 7) & 0xFF] == floor(log2(x)) for x >= 2, else 0.
+        let x = ((s >> 7) & 0xFF) as u32;
+        let exponent: u8 = if x < 2 { 0 } else { (31 - x.leading_zeros()) as u8 };
+        let mantissa = ((s >> (exponent as i32 + 3)) & 0x0F) as u8;
+        !(sign | (exponent << 4) | mantissa)
+    }
+
+    let mut enc = pcmu::PcmuEncoder::new();
+    let mut out = [0u8; 1];
+    let mut mismatches = 0u32;
+    for i in 0..=u16::MAX {
+        let sample = i as i16;
+        let n = enc.encode_into(&[sample], &mut out).expect("encode_into");
+        assert_eq!(n, 1);
+        if out[0] != canonical_ulaw(sample) {
+            mismatches += 1;
+            if mismatches <= 5 {
+                eprintln!(
+                    "µ-law mismatch: sample={sample} got={:#04x} want={:#04x}",
+                    out[0],
+                    canonical_ulaw(sample)
+                );
+            }
+        }
+    }
+    assert_eq!(
+        mismatches, 0,
+        "{mismatches}/65536 µ-law codes differ from canonical G.711"
+    );
+}
+
 fn max_abs_err(a: &[i16], b: &[i16]) -> i32 {
     a.iter()
         .zip(b.iter())
