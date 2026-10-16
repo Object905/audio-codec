@@ -442,14 +442,17 @@ impl<'a> Resampler<'a> {
 /// Best SIMD level available: runtime-detected when possible (`std`, wasm32),
 /// otherwise the level implied by the compile-time target features.
 ///
-/// AVX-512 is downgraded to AVX2: the filter is at most 128-bit `pmaddwd`
-/// wide either way, but at the AVX-512 level LLVM also autovectorizes the
-/// block staging with 512-bit instructions. On Ice Lake (Xeon Gold 6354)
-/// that made every ratio 20-25% slower than AVX2.
+/// Only AVX-512 is downgraded, to AVX2: the filter is at most 128-bit
+/// `pmaddwd` wide either way, but at the AVX-512 level LLVM also
+/// autovectorizes the block staging with 512-bit instructions. On Ice Lake
+/// (Xeon Gold 6354) that made every ratio 20-25% slower than AVX2. Other
+/// levels are used as detected.
 fn default_level() -> Level {
     let level = Level::try_detect().unwrap_or_else(Level::baseline);
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    if let Some(avx2) = level.as_avx2() {
+    if level.as_avx512().is_some()
+        && let Some(avx2) = level.as_avx2()
+    {
         return avx2.level();
     }
     level
