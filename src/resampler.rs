@@ -370,14 +370,16 @@ impl<'a> Resampler<'a> {
 /// Best SIMD level available: runtime-detected when possible (`std`, wasm32),
 /// otherwise the level implied by the compile-time target features.
 ///
-/// AVX-512 is downgraded to AVX2: the kernel is 8 lanes wide either way, and
-/// at the AVX-512 level LLVM autovectorizes the buffer setup and sample
-/// conversion with 512-bit instructions, whose frequency-license transitions
-/// made it ~10% slower than AVX2 on Ice Lake.
+/// Only AVX-512 is downgraded, to AVX2: the kernel is 8 lanes wide either
+/// way, but at the AVX-512 level LLVM also autovectorizes the buffer setup
+/// and sample conversion with 512-bit instructions. On Ice Lake that was
+/// 5-15% slower than AVX2 in 3 of 4 cases. Other levels are used as detected.
 fn default_level() -> Level {
     let level = Level::try_detect().unwrap_or_else(Level::baseline);
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    if let Some(avx2) = level.as_avx2() {
+    if level.as_avx512().is_some()
+        && let Some(avx2) = level.as_avx2()
+    {
         return avx2.level();
     }
     level
@@ -721,7 +723,9 @@ mod tests {
                 expected.len(),
                 (input.len() * output_rate).div_ceil(input_rate)
             );
-            for chunk_size in [1, 2, 3, 5, 7, 11, 23, 24, 25, 47, 88, 160, 255, 256, 257, 319] {
+            for chunk_size in [
+                1, 2, 3, 5, 7, 11, 23, 24, 25, 47, 88, 160, 255, 256, 257, 319,
+            ] {
                 r.reset();
                 let mut got = Vec::new();
                 let mut consumed = 0;
