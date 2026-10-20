@@ -547,8 +547,24 @@ impl BoxedResampler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::f32::consts::PI as PI_F32;
+    use alloc::boxed::Box;
+    use alloc::vec;
+    use alloc::vec::Vec;
+    use core::f32::consts::PI as PI_F32;
+    #[cfg(feature = "std")]
     use std::time::Instant;
+
+    /// no_std stand-in for the std-only convenience `resample()`: same
+    /// contract (buffer sized by `max_output_samples`, truncated to the
+    /// produced count) so the whole suite also runs without `std`.
+    fn resample(r: &mut Resampler<'_>, input: &[Sample]) -> Vec<Sample> {
+        let mut out = vec![0i16; r.max_output_samples(input.len())];
+        let n = r
+            .resample_into(input, &mut out)
+            .expect("out sized by max_output_samples");
+        out.truncate(n);
+        out
+    }
 
     fn new_resampler(input_rate: usize, output_rate: usize) -> Resampler<'static> {
         // Leak intentionally: tests are short-lived and we need a 'static reference.
@@ -587,7 +603,7 @@ mod tests {
         ] {
             let input: Vec<i16> = (0..2000).map(|i| ((i * 37 % 200) - 100) as i16).collect();
             let mut r = new_resampler(input_rate, output_rate);
-            let expected = r.resample(&input);
+            let expected = resample(&mut r, &input);
             assert_eq!(
                 expected.len(),
                 (input.len() * output_rate).div_ceil(input_rate)
@@ -600,14 +616,14 @@ mod tests {
                 let mut got = Vec::new();
                 let mut consumed = 0;
                 for chunk in input.chunks(chunk_size) {
-                    got.extend(r.resample(chunk));
+                    got.extend(resample(&mut r, chunk));
                     consumed += chunk.len();
                     assert_eq!(
                         got.len(),
                         (consumed * output_rate).div_ceil(input_rate),
                         "{input_rate} -> {output_rate}, chunk {chunk_size}, consumed {consumed}"
                     );
-                    assert!(r.resample(&[]).is_empty());
+                    assert!(resample(&mut r, &[]).is_empty());
                 }
                 assert_eq!(
                     got, expected,
@@ -615,11 +631,13 @@ mod tests {
                 );
             }
             r.reset();
-            assert_eq!(r.resample(&input), expected);
+            assert_eq!(resample(&mut r, &input), expected);
         }
     }
 
-    #[cfg(feature = "opus")]
+    // Uses the std-only allocating `OpusEncoder::encode`; the resampler's
+    // output counts themselves are covered portably by the exact-count tests.
+    #[cfg(all(feature = "opus", feature = "std"))]
     #[test]
     fn test_resampled_20ms_frames_encode_as_opus() {
         use crate::{Encoder, opus::OpusEncoder};
@@ -628,7 +646,7 @@ mod tests {
             let mut r = new_resampler(input_rate, 48000);
             let mut encoder = OpusEncoder::new_default();
             for _ in 0..3 {
-                let pcm = r.resample(&vec![0; input_rate / 50]);
+                let pcm = resample(&mut r, &vec![0; input_rate / 50]);
                 assert_eq!(pcm.len(), 960);
                 assert!(!encoder.encode(&pcm).is_empty());
             }
@@ -639,7 +657,7 @@ mod tests {
     fn test_resample_8k_to_16k() {
         let mut resampler = new_resampler(8000, 16000);
         let input = vec![1000i16; 80];
-        let output = resampler.resample(&input);
+        let output = resample(&mut resampler, &input);
         assert!(output.len() >= 150 && output.len() <= 170);
         for &s in &output[48..output.len().saturating_sub(48)] {
             assert!((s - 1000).abs() < 100, "Value {} is too far from 1000", s);
@@ -650,7 +668,7 @@ mod tests {
     fn test_resample_16k_to_8k() {
         let mut resampler = new_resampler(16000, 8000);
         let input = vec![1000i16; 160];
-        let output = resampler.resample(&input);
+        let output = resample(&mut resampler, &input);
         assert!(output.len() >= 75 && output.len() <= 85);
         let skip = output.len() / 4;
         for &s in &output[skip..output.len() - skip] {
@@ -666,7 +684,7 @@ mod tests {
             .map(|i| ((i as f32 * freq * 2.0 * PI_F32 / 16000.0).sin() * 10000.0) as i16)
             .collect();
 
-        let output = resampler.resample(&samples);
+        let output = resample(&mut resampler, &samples);
 
         // Output should have similar amplitude (allowing for some attenuation)
         let input_rms: f32 = samples
@@ -698,7 +716,7 @@ mod tests {
             .map(|i| ((i as f32 * freq * 2.0 * PI_F32 / 16000.0).sin() * 10000.0) as i16)
             .collect();
 
-        let output = resampler.resample(&samples);
+        let output = resample(&mut resampler, &samples);
 
         let output_rms: f32 =
             (output.iter().map(|&s| (s as f32).powi(2)).sum::<f32>() / output.len() as f32).sqrt();
@@ -711,6 +729,9 @@ mod tests {
         );
     }
 
+    // Uses `std::time::Instant`; the integer kernel itself is covered by
+    // the portable tests above.
+    #[cfg(feature = "std")]
     #[test]
     fn test_performance_48k_to_8k() {
         let mut resampler = new_resampler(48000, 8000);
@@ -719,7 +740,7 @@ mod tests {
         let start = Instant::now();
         let iterations = 100;
         for _ in 0..iterations {
-            let _ = resampler.resample(&input);
+            let _ = resample(&mut resampler, &input);
             resampler.reset();
         }
         let duration = start.elapsed();
@@ -747,12 +768,12 @@ mod tests {
             .collect();
 
         let mut resampler1 = new_resampler(input_rate, output_rate);
-        let output1 = resampler1.resample(&input);
+        let output1 = resample(&mut resampler1, &input);
 
         let mut resampler2 = new_resampler(input_rate, output_rate);
         let mid = input.len() / 2;
-        let mut output2 = resampler2.resample(&input[..mid]);
-        output2.extend_from_slice(&resampler2.resample(&input[mid..]));
+        let mut output2 = resample(&mut resampler2, &input[..mid]);
+        output2.extend_from_slice(&resample(&mut resampler2, &input[mid..]));
 
         assert_eq!(output1.len(), output2.len(), "Output lengths differ");
 
@@ -784,7 +805,7 @@ mod tests {
         let input: Vec<i16> = (0..2000)
             .map(|i| (((i * 37) % 200 - 100) * 60) as i16)
             .collect();
-        let got = r.resample(&input);
+        let got = resample(&mut r, &input);
 
         // f32 reference: derive positions from the absolute output index,
         // independently of the streaming accumulator, using the same Q15 taps.
@@ -815,7 +836,6 @@ mod tests {
             .sum();
         let sig: f64 = want.iter().map(|&b| (b as f64) * (b as f64)).sum();
         let snr = 10.0 * (sig / se.max(1.0)).log10();
-        println!("Q15 vs f32-accumulator SNR = {:.1} dB", snr);
         assert!(
             snr > 60.0,
             "integer core diverges from float: {:.1} dB",
@@ -838,7 +858,7 @@ mod tests {
         let expected = {
             let mut coeffs = vec![0i16; COEFFS_LEN];
             let mut borrowed = Resampler::new(input_rate, output_rate, &mut coeffs).unwrap();
-            borrowed.resample(&input)
+            resample(&mut borrowed, &input)
         };
 
         let mut boxed = BoxedResampler::new(input_rate, output_rate).unwrap();
@@ -937,14 +957,18 @@ mod tests {
     /// reference bit for bit.
     #[test]
     fn test_simd_matches_scalar_reference() {
+        // `Level::new()` (runtime detection) needs fearless_simd's `std` feature.
+        #[cfg(feature = "std")]
         let levels = [Level::baseline(), default_level(), Level::new()];
+        #[cfg(not(feature = "std"))]
+        let levels = [Level::baseline(), default_level()];
         for (from, to) in RATIOS {
             for input in test_signals(2000) {
                 for level in levels {
                     let mut r = new_resampler(from, to);
                     r.level = level;
                     let expected = reference_resample(r.coeffs, from, to, &input);
-                    let got = r.resample(&input);
+                    let got = resample(&mut r, &input);
                     assert_eq!(expected, got, "{from}->{to} {level:?}");
                 }
             }
@@ -978,7 +1002,6 @@ mod tests {
                 worst = worst.max(mid).max(outer);
             }
         }
-        println!("worst per-part sum(|coeff|) = {worst} (limit {MAX_PART_ABS_COEFF_SUM})");
         assert!(worst <= MAX_PART_ABS_COEFF_SUM);
     }
 
@@ -1019,12 +1042,12 @@ mod tests {
     fn test_chunked_is_bit_identical() {
         let [input, _] = test_signals(3000);
         for (from, to) in RATIOS {
-            let whole = new_resampler(from, to).resample(&input);
+            let whole = resample(&mut new_resampler(from, to), &input);
             for chunk in [1, 2, 7, 23, 24, 25, 47, 160, 255, 256, 257, 1000] {
                 let mut r = new_resampler(from, to);
                 let mut chunked = Vec::new();
                 for part in input.chunks(chunk) {
-                    chunked.extend_from_slice(&r.resample(part));
+                    chunked.extend_from_slice(&resample(&mut r, part));
                 }
                 assert_eq!(whole, chunked, "{from}->{to} chunk={chunk}");
             }
@@ -1037,7 +1060,7 @@ mod tests {
     fn test_dc_gain_all_ratios() {
         for (from, to) in RATIOS {
             for level in [1000i16, -20000, i16::MAX] {
-                let output = new_resampler(from, to).resample(&vec![level; 2000]);
+                let output = resample(&mut new_resampler(from, to), &vec![level; 2000]);
                 // Skip the filter warm-up (history starts zeroed).
                 let warmup = (TAPS_PER_PHASE * to).div_ceil(from) + 1;
                 // 24 taps quantised to 1/32768 each: error well under 0.1%.
@@ -1089,7 +1112,7 @@ mod tests {
         let [input, _] = test_signals(500);
         let mut r = new_resampler(16000, 16000);
         assert_eq!(r.max_output_samples(input.len()), input.len());
-        assert_eq!(r.resample(&input), input);
+        assert_eq!(resample(&mut r, &input), input);
     }
 
     #[test]
@@ -1115,10 +1138,10 @@ mod tests {
     fn test_reset_mid_stream() {
         let [input, _] = test_signals(1000);
         let mut r = new_resampler(44100, 48000);
-        let fresh = r.resample(&input);
+        let fresh = resample(&mut r, &input);
         // 13 samples leaves partial history and a non-zero `pos`.
-        r.resample(&input[..13]);
+        resample(&mut r, &input[..13]);
         r.reset();
-        assert_eq!(r.resample(&input), fresh);
+        assert_eq!(resample(&mut r, &input), fresh);
     }
 }

@@ -308,7 +308,11 @@ impl Encoder for OpusEncoder {
     }
 }
 
-#[cfg(test)]
+// The tests below exercise the std-only allocating `encode`/`decode`
+// conveniences (including the stereo-downmix handling), so they only compile
+// with `std`. The `*_into` trait API is covered portably by
+// `test_opus_into_roundtrip` at the bottom, which also runs in `no_std`.
+#[cfg(all(test, feature = "std"))]
 mod tests {
     use super::*;
 
@@ -430,5 +434,40 @@ mod tests {
             960,
             "stereo packet should downmix to 960 mono samples"
         );
+    }
+}
+
+/// Portable roundtrip through the trait `encode_into`/`decode_into` API
+/// (compiles with or without `std`; the no_std opus path).
+#[cfg(all(test, feature = "opus"))]
+mod no_std_tests {
+    use super::*;
+    use alloc::vec;
+    use alloc::vec::Vec;
+
+    #[test]
+    fn test_opus_into_roundtrip() {
+        let mut enc = OpusEncoder::new_default();
+        let mut dec = OpusDecoder::new(48000, 1);
+        let pcm: Vec<i16> = (0..960).map(|i| ((i * 100) % 32767) as i16).collect();
+
+        let mut packet = alloc::vec![0u8; enc.max_encode_bytes(pcm.len())];
+        let n = enc
+            .encode_into(&pcm, &mut packet)
+            .expect("packet sized by max_encode_bytes");
+        packet.truncate(n);
+        assert!(!packet.is_empty(), "encoder should produce output");
+
+        let mut out = alloc::vec![0i16; dec.max_decode_samples(packet.len())];
+        let samples = dec
+            .decode_into(&packet, &mut out)
+            .expect("out sized by max_decode_samples");
+        assert_eq!(samples, 960, "20 ms at 48 kHz must decode to 960 samples");
+        let rms: f64 = out[..samples]
+            .iter()
+            .map(|&s| (s as f64) * (s as f64))
+            .sum::<f64>()
+            / samples as f64;
+        assert!(rms.sqrt() > 1000.0, "decoded signal should keep energy");
     }
 }
