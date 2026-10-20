@@ -63,7 +63,12 @@ struct OggOpusWriter<W: Write> {
 
 impl<W: Write> OggOpusWriter<W> {
     fn new(w: W, serial: u32) -> Self {
-        Self { w, crc: ogg_crc_table(), serial, page_seq: 0 }
+        Self {
+            w,
+            crc: ogg_crc_table(),
+            serial,
+            page_seq: 0,
+        }
     }
 
     fn page(&mut self, packets: &[&[u8]], granule: i64, header_type: u8) -> std::io::Result<()> {
@@ -72,7 +77,10 @@ impl<W: Write> OggOpusWriter<W> {
         for &p in packets {
             payload.extend_from_slice(p);
             let mut remaining = p.len();
-            while remaining >= 255 { segs.push(255); remaining -= 255; }
+            while remaining >= 255 {
+                segs.push(255);
+                remaining -= 255;
+            }
             segs.push(remaining as u8);
         }
         let n_seg = segs.len() as u8;
@@ -121,7 +129,9 @@ impl<W: Write> OggOpusWriter<W> {
 }
 
 fn rms(s: &[i16]) -> f64 {
-    if s.is_empty() { return 0.0; }
+    if s.is_empty() {
+        return 0.0;
+    }
     (s.iter().map(|&x| (x as f64).powi(2)).sum::<f64>() / s.len() as f64).sqrt()
 }
 
@@ -141,7 +151,10 @@ fn main() {
     assert!(&d[8..12] == b"WAVE", "not WAVE");
 
     // Find fmt + data chunks
-    let mut fmt_tag = 0u16; let mut ch = 1u16; let mut sr = 8000u32; let mut bps = 8u16;
+    let mut fmt_tag = 0u16;
+    let mut ch = 1u16;
+    let mut sr = 8000u32;
+    let mut bps = 8u16;
     let mut data = Vec::new();
     let mut i = 12usize;
     while i + 8 <= d.len() {
@@ -158,11 +171,19 @@ fn main() {
         }
         i += 8 + sz + (sz & 1);
     }
-    eprintln!("WAV: fmt_tag={} ch={} sr={}bps={}  data={} bytes", fmt_tag, ch, sr, bps, data.len());
+    eprintln!(
+        "WAV: fmt_tag={} ch={} sr={}bps={}  data={} bytes",
+        fmt_tag,
+        ch,
+        sr,
+        bps,
+        data.len()
+    );
 
     // ---- FileAudioSource decode_all (A-law: read 160-bytes chunks → decode → cache) ----
     let pcm_cache: Vec<i16> = match fmt_tag {
-        6 => { // A-law
+        6 => {
+            // A-law
             let mut dec = audio_codec::pcma::PcmaDecoder::new();
             let mut pcm = Vec::new();
             let mut pos = 0;
@@ -173,15 +194,22 @@ fn main() {
             }
             if ch > 1 {
                 // sync mono to stereo (rustpbx mix_stereo_to_mono)
-                pcm.chunks_exact(ch as usize).map(|c| ((c.iter().map(|&x| x as i32).sum::<i32>()) / ch as i32) as i16).collect()
+                pcm.chunks_exact(ch as usize)
+                    .map(|c| ((c.iter().map(|&x| x as i32).sum::<i32>()) / ch as i32) as i16)
+                    .collect()
             } else {
                 pcm
             }
         }
         1 if bps == 16 => {
-            let pcm: Vec<i16> = data.chunks_exact(2).map(|c| i16::from_le_bytes([c[0], c[1]])).collect();
+            let pcm: Vec<i16> = data
+                .chunks_exact(2)
+                .map(|c| i16::from_le_bytes([c[0], c[1]]))
+                .collect();
             if ch > 1 {
-                pcm.chunks_exact(ch as usize).map(|c| ((c.iter().map(|&x| x as i32).sum::<i32>()) / ch as i32) as i16).collect()
+                pcm.chunks_exact(ch as usize)
+                    .map(|c| ((c.iter().map(|&x| x as i32).sum::<i32>()) / ch as i32) as i16)
+                    .collect()
             } else {
                 pcm
             }
@@ -190,7 +218,9 @@ fn main() {
     };
     eprintln!(
         "decode_all: {} samples @ {} Hz  RMS {:.0}",
-        pcm_cache.len(), sr, rms(&pcm_cache)
+        pcm_cache.len(),
+        sr,
+        rms(&pcm_cache)
     );
 
     // ---- Rustpbx next_audio_sample + ResamplingAudioSource ----
@@ -211,12 +241,15 @@ fn main() {
 
     loop {
         // ---- ResamplingAudioSource::read_samples ----
-        let needed_source = (pcm_buf.len() as u64 * sr as u64).div_ceil(target_rate as u64) as usize;
+        let needed_source =
+            (pcm_buf.len() as u64 * sr as u64).div_ceil(target_rate as u64) as usize;
         let mut intermediate = vec![0i16; needed_source];
 
         let read = {
             let remaining = pcm_cache.len() - cache_pos;
-            if remaining == 0 { break; }
+            if remaining == 0 {
+                break;
+            }
             let copy = remaining.min(needed_source);
             intermediate[..copy].copy_from_slice(&pcm_cache[cache_pos..cache_pos + copy]);
             cache_pos += copy;
@@ -232,8 +265,14 @@ fn main() {
         let pcm_rms = rms(&pcm_buf[..copy_len]);
 
         if frame_no < 3 || frame_no % 50 == 0 {
-            eprintln!("  frame {:>3}: read={} copy_len={} pcm_rms={:.0} opus_len={}",
-                frame_no, read, copy_len, pcm_rms, encoded.len());
+            eprintln!(
+                "  frame {:>3}: read={} copy_len={} pcm_rms={:.0} opus_len={}",
+                frame_no,
+                read,
+                copy_len,
+                pcm_rms,
+                encoded.len()
+            );
         }
 
         opus_packets.push(encoded);
@@ -249,7 +288,11 @@ fn main() {
         let samples = dec.decode(p);
         decoded_pcm.extend_from_slice(&samples);
     }
-    eprintln!("decoded: {} samples  RMS {:.0}", decoded_pcm.len(), rms(&decoded_pcm));
+    eprintln!(
+        "decoded: {} samples  RMS {:.0}",
+        decoded_pcm.len(),
+        rms(&decoded_pcm)
+    );
 
     // ---- Write Ogg/Opus file ----
     {
@@ -264,7 +307,8 @@ fn main() {
             if segs + p_segs > 240 {
                 let refs: Vec<&[u8]> = buf.iter().map(|v| v.as_slice()).collect();
                 mux.page(&refs, (960 * last_idx) as i64, 0).unwrap();
-                buf.clear(); segs = 0;
+                buf.clear();
+                segs = 0;
             }
             buf.push(p.clone());
             segs += p_segs;
@@ -274,9 +318,17 @@ fn main() {
         let refs: Vec<&[u8]> = buf.iter().map(|v| v.as_slice()).collect();
         mux.page(&refs, total, 0x04).unwrap();
     }
-    eprintln!("Wrote: {} (Ogg/Opus, {} frames)", out_path, opus_packets.len());
+    eprintln!(
+        "Wrote: {} (Ogg/Opus, {} frames)",
+        out_path,
+        opus_packets.len()
+    );
 
     // ---- Write WAV for reference ----
     write_wav_mono_48k(&wav_path, &decoded_pcm);
-    eprintln!("Wrote: {} (decoded ref, RMS {:.0})", wav_path, rms(&decoded_pcm));
+    eprintln!(
+        "Wrote: {} (decoded ref, RMS {:.0})",
+        wav_path,
+        rms(&decoded_pcm)
+    );
 }

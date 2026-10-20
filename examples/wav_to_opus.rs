@@ -14,8 +14,8 @@ use std::fs::File;
 use std::io::{BufWriter, Read, Write};
 
 use audio_codec::{
-    opus::{OpusApplication, OpusDecoder, OpusEncoder},
     BoxedResampler, Decoder as _, Encoder as _,
+    opus::{OpusApplication, OpusDecoder, OpusEncoder},
 };
 
 // ---------- IO helpers ----------
@@ -23,7 +23,8 @@ use audio_codec::{
 fn read_file(path: &str) -> Vec<u8> {
     let mut f = File::open(path).unwrap_or_else(|e| panic!("open {path}: {e}"));
     let mut v = Vec::new();
-    f.read_to_end(&mut v).unwrap_or_else(|e| panic!("read {path}: {e}"));
+    f.read_to_end(&mut v)
+        .unwrap_or_else(|e| panic!("read {path}: {e}"));
     v
 }
 
@@ -50,8 +51,7 @@ fn parse_wav(d: &[u8]) -> Wav {
         let sz = u32::from_le_bytes([d[i + 4], d[i + 5], d[i + 6], d[i + 7]]) as usize;
         let body = &d[i + 8..i + 8 + sz.min(d.len() - i - 8)];
         if cid == b"fmt " {
-            let (tag, ch, sr, br, ba, bps) =
-                crate_ugh_from_slice(body); // see helper below
+            let (tag, ch, sr, br, ba, bps) = crate_ugh_from_slice(body); // see helper below
             fmt = Some((tag, ch, sr, br, ba, bps));
         } else if cid == b"data" {
             data = body.to_vec();
@@ -105,7 +105,9 @@ fn wav_to_pcm_mono(wav: &Wav) -> Vec<i16> {
             } else {
                 // downmix to mono
                 s.chunks_exact(wav.channels as usize)
-                    .map(|ch| ((ch.iter().map(|&x| x as i32).sum::<i32>()) / ch.len() as i32) as i16)
+                    .map(|ch| {
+                        ((ch.iter().map(|&x| x as i32).sum::<i32>()) / ch.len() as i32) as i16
+                    })
                     .collect()
             }
         }
@@ -374,7 +376,11 @@ fn main() {
         let refs: Vec<&[u8]> = buf.iter().map(|v| v.as_slice()).collect();
         mux.page(&refs, total_samples, 0x04).unwrap(); // EOS
     }
-    println!("\n== wrote {} (Ogg/Opus, {} frames) ==", out_path, opus_packets.len());
+    println!(
+        "\n== wrote {} (Ogg/Opus, {} frames) ==",
+        out_path,
+        opus_packets.len()
+    );
 
     // ---- Step 5: decode back -> WAV to verify the codec path sounds clean ----
     {
@@ -386,10 +392,17 @@ fn main() {
         }
         let verify = format!(
             "{}.decoded.wav",
-            out_path.rsplit_once('.').map(|(b, _)| b).unwrap_or(out_path)
+            out_path
+                .rsplit_once('.')
+                .map(|(b, _)| b)
+                .unwrap_or(out_path)
         );
         write_wav_mono_48k(&verify, &decoded);
-        println!("== wrote {} (opus->pcm 48k mono, RMS {:.0}) ==", verify, rms_i16(&decoded));
+        println!(
+            "== wrote {} (opus->pcm 48k mono, RMS {:.0}) ==",
+            verify,
+            rms_i16(&decoded)
+        );
 
         // NOTE: do NOT judge speech quality by waveform SNR: opus is lossy and
         // pitch-tracking, so the decoded waveform decorrelates from the input
@@ -397,7 +410,9 @@ fn main() {
         // Instead, sanity-check the codec with a stationary tone (waveform-
         // preserving for steady signals) and trust your ears on decoded.wav.
         let tone: Vec<i16> = (0..960 * 40)
-            .map(|i| (16000.0 * (2.0 * std::f64::consts::PI * 440.0 * i as f64 / 48000.0).sin()) as i16)
+            .map(|i| {
+                (16000.0 * (2.0 * std::f64::consts::PI * 440.0 * i as f64 / 48000.0).sin()) as i16
+            })
             .collect();
         let mut tenc = OpusEncoder::new_with_application(48_000, 2, OpusApplication::Audio);
         tenc.set_bitrate(128_000);
@@ -466,7 +481,9 @@ fn main() {
     }
 
     // Simulate BUG #3: correct decode but wrong frame size / interleaving noise.
-    println!("BUG #3  bad frame size or planar<->interleave: opus_encode returns Err or garbled frames");
+    println!(
+        "BUG #3  bad frame size or planar<->interleave: opus_encode returns Err or garbled frames"
+    );
 
     println!(
         "\nCorrect pipeline RMS by stage: native {:.0} -> 48k {:.0}. opus-rs & libopus both\n\
