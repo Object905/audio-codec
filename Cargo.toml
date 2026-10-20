@@ -1,6 +1,6 @@
 [package]
 name = "audio-codec"
-version = "0.4.11"
+version = "0.4.12"
 edition = "2024"
 # fearless_simd 1.1 requires 1.89.
 rust-version = "1.89"
