@@ -101,11 +101,64 @@ fn long_loss_fades_to_silence() {
 #[cfg(feature = "plc")]
 #[test]
 fn concealment_before_any_audio_is_silence() {
+    // a stream that starts with a loss: silence until there is audio to
+    // conceal from, on every call (the history fills with that silence)
+    for (codec, frame_len) in [(CodecType::PCMA, 160), (CodecType::G722, 320)] {
+        let mut dec = create_decoder(codec);
+        dec.enable_concealment();
+        for _ in 0..6 {
+            let out = dec.conceal(frame_len);
+            assert_eq!(out.len(), frame_len, "{codec:?}");
+            assert!(out.iter().all(|s| *s == 0), "{codec:?}");
+        }
+    }
+}
+
+#[cfg(feature = "plc")]
+#[test]
+fn empty_packet_does_not_end_a_loss() {
+    let mut enc = create_encoder(CodecType::PCMA);
     let mut dec = create_decoder(CodecType::PCMA);
     dec.enable_concealment();
-    let out = dec.conceal(160);
-    assert_eq!(out.len(), 160);
-    assert!(out.iter().all(|s| *s == 0));
+    for f in 0..8 {
+        dec.decode(&enc.encode(&tone(8000, 160, f)));
+    }
+    let first = dec.conceal(160);
+    let second = dec.conceal(160);
+    assert!(dec.decode(&[]).is_empty());
+    // carries on fading rather than restarting at full level
+    let third = dec.conceal(160);
+    assert!(rms(&second) < rms(&first));
+    assert!(
+        rms(&third) < rms(&second),
+        "loss restarted after an empty packet"
+    );
+}
+
+#[cfg(feature = "plc")]
+#[test]
+fn g722_recovers_after_a_long_loss() {
+    let mut enc = create_encoder(CodecType::G722);
+    let mut dec = create_decoder(CodecType::G722);
+    dec.enable_concealment();
+    for f in 0..8 {
+        dec.decode(&enc.encode(&tone(16000, 320, f)));
+    }
+    // 200 ms lost: faded out long before it ends
+    for f in 8..18 {
+        enc.encode(&tone(16000, 320, f));
+        assert_eq!(dec.conceal(320).len(), 320);
+    }
+    // the tone comes back at its level within a few packets
+    let mut last = vec![];
+    for f in 18..24 {
+        last = dec.decode(&enc.encode(&tone(16000, 320, f)));
+    }
+    assert!(
+        rms(&last) > 0.7 * rms(&tone(16000, 320, 23)),
+        "rms {} after recovery",
+        rms(&last)
+    );
 }
 
 #[cfg(feature = "g729")]

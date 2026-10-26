@@ -6,8 +6,10 @@
 //! quarter is overlap-added with the quarter before it, so each repetition
 //! runs into the next without a step. (Appendix I also smooths the seam
 //! with the last audio played, by holding output back 3.75 ms; this plays
-//! without delay, so that seam is only as smooth as the pitch estimate.) Long losses fade out: the first 10 ms play at full level, then the
-//! level drops by 20% per 10 ms, reaching silence 60 ms in. The first frame
+//! without delay, so that seam is only as smooth as the pitch estimate.)
+//!
+//! Long losses fade out: the first 10 ms play at full level, then the level
+//! drops by 20% per 10 ms, reaching silence 60 ms in. The first frame
 //! decoded after a loss is crossfaded with the continued repetition.
 //!
 //! Heap-free: the history is a fixed array sized for 16 kHz.
@@ -30,6 +32,8 @@ const RECOVER_MS: u32 = 4;
 const MAX_RATE: u32 = 16000;
 const MAX_PERIOD: usize = (MAX_RATE / MIN_PITCH_HZ) as usize + 1;
 const HISTORY: usize = (MAX_RATE * CORR_MS / 1000) as usize + MAX_PERIOD;
+/// Full-level audio kept from just before each extrapolated frame.
+pub(crate) const LEAD: usize = 24;
 
 pub(crate) struct PitchConcealer {
     rate: u32,
@@ -44,6 +48,11 @@ pub(crate) struct PitchConcealer {
     pos: usize,
     /// Samples concealed in the current loss; 0 when not concealing.
     concealed: usize,
+    /// The full-level audio leading into the latest extrapolated frame:
+    /// the audio played before the loss, then the unfaded repetition.
+    lead: [Sample; LEAD],
+    /// The last `LEAD` samples of the latest unfaded extrapolation.
+    tail: [Sample; LEAD],
 }
 
 impl PitchConcealer {
@@ -58,6 +67,8 @@ impl PitchConcealer {
             period_len: 0,
             pos: 0,
             concealed: 0,
+            lead: [0; LEAD],
+            tail: [0; LEAD],
         }
     }
 
@@ -82,6 +93,7 @@ impl PitchConcealer {
     }
 
     /// The last `n` samples remembered, oldest first.
+    #[cfg(test)]
     pub(crate) fn recent(&self, n: usize) -> &[Sample] {
         &self.history[HISTORY - n.min(HISTORY)..]
     }
@@ -89,6 +101,10 @@ impl PitchConcealer {
     /// Record decoded audio. A frame ending a loss is first crossfaded, in
     /// place, with the continued repetition.
     pub(crate) fn on_decoded(&mut self, samples: &mut [Sample]) {
+        if samples.is_empty() {
+            // nothing played: not the end of a loss
+            return;
+        }
         if self.concealed > 0 && self.period_len > 0 {
             let len = self.ms(RECOVER_MS).min(samples.len());
             let gain = self.gain(self.concealed);
@@ -111,13 +127,33 @@ impl PitchConcealer {
             out.fill(0);
             return false;
         }
-        if self.concealed == 0 {
+        // also when a loss began before there was audio to pick from: the
+        // silence played meanwhile went into the history
+        if self.concealed == 0 || self.period_len == 0 {
             self.pick_period();
+            self.lead.copy_from_slice(&self.history[HISTORY - LEAD..]);
+        } else {
+            self.lead = self.tail;
         }
         for s in out.iter_mut() {
             *s = self.next_period_sample();
         }
+        let n = out.len().min(LEAD);
+        self.tail.copy_within(n.., 0);
+        self.tail[LEAD - n..].copy_from_slice(&out[out.len() - n..]);
         true
+    }
+
+    /// The full-level audio leading into the latest extrapolated frame,
+    /// oldest first.
+    pub(crate) fn lead(&self) -> &[Sample; LEAD] {
+        &self.lead
+    }
+
+    /// Whether the next concealed frame will be heard at all, or the loss
+    /// has faded out.
+    pub(crate) fn audible(&self) -> bool {
+        self.gain(self.concealed) > 0
     }
 
     /// Apply the loss's fade to an extrapolated frame and record it as

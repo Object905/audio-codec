@@ -129,7 +129,9 @@ impl Decoder for OpusDecoder {
         true
     }
 
-    /// Conceals with Opus's own packet loss concealment.
+    /// Conceals with Opus's own packet loss concealment. `samples` must be
+    /// an Opus frame size (a multiple of 2.5 ms, at most 20 ms); others
+    /// fail with `DecodeFailed`.
     fn conceal_into(&mut self, samples: usize, out: &mut [Sample]) -> Result<usize, CodecError> {
         self.conceal_into_raw(samples, out)
     }

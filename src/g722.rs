@@ -814,8 +814,9 @@ impl G722Decoder {
             out_buffer: 0,
             out_bits: 0,
         };
-        let mut played = [0 as Sample; 24];
-        played.copy_from_slice(plc.recent(24));
+        // full level, like `signal`: once the loss is fading, the audio
+        // played before this frame is not
+        let played = plc.lead();
         for (j, x) in encoder.x.iter_mut().enumerate() {
             // input-timeline sample j of the history window
             let i = j + delay;
@@ -915,7 +916,10 @@ impl Decoder for G722Decoder {
             self.plc = Some(plc);
             return Err(CodecError::BufferTooSmall);
         };
-        if plc.extrapolate(out) {
+        // once the loss has faded out there's no telling where the sender
+        // is: leave the state where the concealment last heard it
+        let audible = plc.audible();
+        if plc.extrapolate(out) && audible {
             self.follow(out, &plc);
         }
         plc.fade(out);
