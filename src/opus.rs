@@ -93,7 +93,64 @@ impl OpusDecoder {
     }
 }
 
+impl OpusDecoder {
+    /// Conceal a lost frame of `samples` samples per channel with Opus's own
+    /// packet loss concealment, without the stereo→mono downmix.
+    fn conceal_into_raw(
+        &mut self,
+        samples: usize,
+        out: &mut [Sample],
+    ) -> Result<usize, CodecError> {
+        let channels = usize::from(self.channels);
+        let total = samples * channels;
+        if total > OPUS_MAX_SAMPLES {
+            return Err(CodecError::InvalidInput);
+        }
+        if out.len() < total {
+            return Err(CodecError::BufferTooSmall);
+        }
+        // opus-rs conceals a packet of 0 or 1 bytes, as libopus does with
+        // `data == NULL`
+        let len = self
+            .decoder
+            .decode(&[], samples, &mut self.w_output_f32[..total])
+            .map_err(|_| CodecError::DecodeFailed)?;
+        let n = len * channels;
+        for (o, f) in out[..n].iter_mut().zip(&self.w_output_f32[..n]) {
+            *o = (f * 32768.0).clamp(-32768.0, 32767.0) as i16;
+        }
+        Ok(n)
+    }
+}
+
 impl Decoder for OpusDecoder {
+    /// Opus's concealment is part of the decoder: always on.
+    fn enable_concealment(&mut self) -> bool {
+        true
+    }
+
+    /// Conceals with Opus's own packet loss concealment.
+    fn conceal_into(&mut self, samples: usize, out: &mut [Sample]) -> Result<usize, CodecError> {
+        self.conceal_into_raw(samples, out)
+    }
+
+    /// Override the default to downmix stereo to mono, as `decode` does.
+    #[cfg(feature = "std")]
+    fn conceal(&mut self, samples: usize) -> PcmBuf {
+        let mut pcm = vec![0i16; samples * usize::from(self.channels)];
+        match self.conceal_into_raw(samples, &mut pcm) {
+            Ok(n) => pcm.truncate(n),
+            Err(_) => return Vec::new(),
+        }
+        if usize::from(self.channels) == 2 {
+            pcm = pcm
+                .chunks_exact(2)
+                .map(|chunk| ((chunk[0] as i32 + chunk[1] as i32) / 2) as i16)
+                .collect();
+        }
+        pcm
+    }
+
     fn decode_into(&mut self, data: &[u8], out: &mut [Sample]) -> Result<usize, CodecError> {
         if data.is_empty() {
             return Ok(0);
@@ -318,6 +375,57 @@ mod tests {
 
     fn make_mono_pcm_20ms() -> Vec<i16> {
         (0..960).map(|i| ((i * 100) % 32767) as i16).collect()
+    }
+
+    /// 20 ms frames of a continuous 220 Hz tone at 48 kHz.
+    fn tone_frame(frame: usize) -> Vec<i16> {
+        (0..960)
+            .map(|i| {
+                let t = (frame * 960 + i) as f32 / 48000.0;
+                (8000.0 * (2.0 * core::f32::consts::PI * 220.0 * t).sin()) as i16
+            })
+            .collect()
+    }
+
+    fn rms(s: &[i16]) -> f64 {
+        (s.iter().map(|x| (*x as f64).powi(2)).sum::<f64>() / s.len() as f64).sqrt()
+    }
+
+    #[test]
+    fn test_opus_conceals_a_lost_frame_with_its_own_plc() {
+        let mut enc = OpusEncoder::new_default();
+        let mut dec = OpusDecoder::new_default();
+        for f in 0..10 {
+            dec.decode(&enc.encode(&tone_frame(f)));
+        }
+        // frame 10 is lost
+        let concealed = dec.conceal(960);
+        assert_eq!(concealed.len(), 960, "downmixed like decode");
+        assert!(
+            rms(&concealed) > 1000.0,
+            "concealment is silent: rms {}",
+            rms(&concealed)
+        );
+        // the stream carries on after the loss
+        enc.encode(&tone_frame(10));
+        let next = dec.decode(&enc.encode(&tone_frame(11)));
+        assert_eq!(next.len(), 960);
+        assert!(rms(&next) > 1000.0);
+    }
+
+    #[test]
+    fn test_opus_conceal_into_is_interleaved_and_checks_the_buffer() {
+        let mut enc = OpusEncoder::new_default();
+        let mut dec = OpusDecoder::new_default();
+        dec.decode(&enc.encode(&tone_frame(0)));
+        let mut out = [0i16; 1920];
+        // stereo decoder: 960 samples per channel, interleaved
+        assert_eq!(dec.conceal_into(960, &mut out), Ok(1920));
+        let mut small = [0i16; 100];
+        assert_eq!(
+            dec.conceal_into(960, &mut small),
+            Err(CodecError::BufferTooSmall)
+        );
     }
 
     #[test]

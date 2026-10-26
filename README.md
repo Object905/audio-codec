@@ -20,6 +20,10 @@ A collection of VoIP audio codecs implemented for Rust. This crate provides a un
   resampler and telephone-event are fully **heap-free** (no allocator needed);
   Opus needs an `alloc` (its internal working set is ~250 KB and is boxed).
 - **Resampler**: Built-in audio resampling utility.
+- **Packet loss concealment**: `Decoder::conceal_into` fills in for a lost
+  packet. Opus uses its own; G.711 and G.722 get pitch-repetition
+  concealment (G.711 Appendix I style), with G.722's ADPCM state carried
+  through the loss, behind the `plc` feature and `enable_concealment()`.
 
 ## Performance
 
@@ -110,6 +114,37 @@ fn main() {
     println!("Decoded {} samples", decoded_pcm.len());
 }
 ```
+
+### Packet loss concealment
+
+When a packet is lost, ask the decoder for audio to play in its place
+instead of leaving a gap. Call `conceal_into` (or `conceal`) once per lost
+packet, in order, between the `decode` calls of the packets around it.
+
+```rust
+use audio_codec::{create_decoder, CodecType, Decoder};
+
+fn main() {
+    let mut decoder = create_decoder(CodecType::G722);
+    // off by default; G.711 and G.722 also need the `plc` feature
+    if decoder.enable_concealment() {
+        let concealed = decoder.conceal(320); // one 20 ms packet @ 16kHz
+        println!("Concealed {} samples", concealed.len());
+    }
+}
+```
+
+- **Opus** uses its own concealment, always available.
+- **G.711 / G.722** repeat the last pitch period of the decoded audio,
+  continuing the waveform, fading to silence 60 ms into a loss, and
+  crossfade into the next decoded packet. G.722 also carries its ADPCM
+  state along the concealment (as G.722 Appendices III/IV do), so the
+  packets after the loss decode closer to what the sender encoded.
+  Enabling it boxes a ~1.7 KB history per decoder and copies each decoded
+  packet into it; with the `plc` feature off, or not enabled, the decoders
+  are unchanged.
+- **G.729** and **Telephone Event** have none: `conceal_into` returns
+  `Ok(0)` and the caller conceals the gap itself.
 
 ## `no_std` support
 

@@ -29,6 +29,11 @@ default = ["std", "opus", "g729"]
 # resamplers pick the best SIMD level available. Without it the SIMD level is
 # fixed at compile time (SSE2 on x86_64 unless `-C target-feature` says more).
 std = ["g729-sys?/std", "opus-rs?/std", "opus-rs?/heap", "fearless_simd/std"]
+# Packet loss concealment for the G.711 and G.722 decoders
+# (`Decoder::enable_concealment`), which otherwise have none. Off by
+# default: it adds a boxed ~1.7 KB history to each decoder that enables it,
+# so it needs an allocator. Opus's own concealment needs no feature.
+plc = []
 # Opus support. On by default. opus-rs uses `libm` for transcendentals when
 # `std` is off (no_std build).
 opus = ["dep:opus-rs", "opus-rs/libm"]

@@ -1,4 +1,8 @@
+#[cfg(feature = "plc")]
+use super::plc::PitchConcealer;
 use super::{CodecError, Decoder, Encoder, Sample};
+#[cfg(feature = "plc")]
+use alloc::boxed::Box;
 
 #[cfg(feature = "std")]
 use super::PcmBuf;
@@ -57,6 +61,10 @@ const HIGH_QUANT_INDEX_NEG: [i32; 3] = [0, 1, 0];
 // Positive high band quantization indices
 const HIGH_QUANT_INDEX_POS: [i32; 3] = [0, 3, 2];
 
+/// Delay through the QMF analysis and synthesis filters, in 16 kHz samples.
+#[cfg(feature = "plc")]
+const QMF_DELAY: usize = 22;
+
 // Scale factor adaptation table for high band
 const SCALE_FACTOR_ADJUST_HIGH: [i32; 3] = [0, -214, 798];
 
@@ -91,7 +99,7 @@ impl Bitrate {
 
 /// G.722 ADPCM band state structure used in the codec
 /// Each band (lower and upper) uses an independent state structure
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct G722Band {
     /// Current signal prediction value (signal estimate)
     signal_estimate: i32,
@@ -246,6 +254,9 @@ pub struct G722Decoder {
     band: [G722Band; 2],
     in_buffer: u32,
     in_bits: i32,
+    /// Packet loss concealment, once enabled.
+    #[cfg(feature = "plc")]
+    plc: Option<Box<PitchConcealer>>,
 }
 
 impl G722Encoder {
@@ -561,6 +572,8 @@ impl G722Decoder {
             band: Default::default(),
             in_buffer: 0,
             in_bits: 0,
+            #[cfg(feature = "plc")]
+            plc: None,
         }
     }
 
@@ -768,7 +781,67 @@ impl G722Decoder {
                 written += 2;
             }
         }
+        #[cfg(feature = "plc")]
+        if let Some(plc) = &mut self.plc {
+            plc.on_decoded(&mut out[..written]);
+        }
         Ok(written)
+    }
+
+    /// Carry the ADPCM state through a loss along `signal`, the concealment
+    /// at full level: encode it from the decoder's own state (encoder and
+    /// decoder adapt identically on the same codes) and decode the codes,
+    /// discarding the audio. Left alone, the state would stay where the
+    /// loss began while the sender's moved on, and the first packets after
+    /// the loss would decode with a mismatched predictor and step size.
+    #[cfg(feature = "plc")]
+    fn follow(&mut self, signal: &[Sample], plc: &PitchConcealer) {
+        // The decoder's output lags the sender's input by the QMF filter
+        // pair's delay. The sender's state at the end of the lost packet
+        // has seen input that much further on, so encode the concealment
+        // shifted by it: the analysis history ends `delay` samples into
+        // `signal`, and the encoding runs `delay` samples past its end.
+        let delay = if self.eight_k { 0 } else { QMF_DELAY };
+        let n = signal.len();
+        let ahead: [Sample; QMF_DELAY] = core::array::from_fn(|k| plc.peek(k));
+        let at = |i: usize| if i < n { signal[i] } else { ahead[i - n] };
+        let mut encoder = G722Encoder {
+            packed: false,
+            eight_k: self.eight_k,
+            bits_per_sample: self.bits_per_sample,
+            x: [0; 24],
+            band: self.band.clone(),
+            out_buffer: 0,
+            out_bits: 0,
+        };
+        let mut played = [0 as Sample; 24];
+        played.copy_from_slice(plc.recent(24));
+        for (j, x) in encoder.x.iter_mut().enumerate() {
+            // input-timeline sample j of the history window
+            let i = j + delay;
+            *x = if i < 24 { played[i] } else { at(i - 24) } as i32;
+        }
+        let mut chunk = [0 as Sample; 64];
+        let mut codes = [0u8; 64];
+        let mut i = delay;
+        while i < n + delay {
+            let len = (n + delay - i).min(64);
+            for (k, c) in chunk[..len].iter_mut().enumerate() {
+                *c = at(i + k);
+            }
+            i += len;
+            let Ok(written) = encoder.g722_encode_into(&chunk[..len], &mut codes) else {
+                return;
+            };
+            for &code in &codes[..written] {
+                let (wd1, ihigh, wd2) = self.parse_code(code as i32);
+                let rlow = self.process_low_band(wd1, wd2);
+                if !self.eight_k {
+                    let rhigh = self.process_high_band(ihigh);
+                    self.apply_qmf_synthesis(rlow, rhigh);
+                }
+            }
+        }
     }
 
     /// Decodes a G.722 frame into a freshly-allocated `Vec`.
@@ -829,6 +902,35 @@ impl Decoder for G722Decoder {
         self.decode_frame_into(data, out)
     }
 
+    /// Conceals with G.711 Appendix I style pitch repetition, carrying the
+    /// ADPCM state along the concealment (in the spirit of G.722 Appendices
+    /// III/IV, which also keep the decoder state in step through a loss).
+    #[cfg(feature = "plc")]
+    fn conceal_into(&mut self, samples: usize, out: &mut [Sample]) -> Result<usize, CodecError> {
+        // taken out for the loss, so `follow` can decode while reading it
+        let Some(mut plc) = self.plc.take() else {
+            return Ok(0);
+        };
+        let Some(out) = out.get_mut(..samples) else {
+            self.plc = Some(plc);
+            return Err(CodecError::BufferTooSmall);
+        };
+        if plc.extrapolate(out) {
+            self.follow(out, &plc);
+        }
+        plc.fade(out);
+        self.plc = Some(plc);
+        Ok(samples)
+    }
+
+    #[cfg(feature = "plc")]
+    fn enable_concealment(&mut self) -> bool {
+        let rate = if self.eight_k { 8000 } else { 16000 };
+        self.plc
+            .get_or_insert_with(|| Box::new(PitchConcealer::new(rate)));
+        true
+    }
+
     fn max_decode_samples(&self, n_bytes: usize) -> usize {
         // 16kHz mode: 2 samples per byte. 8kHz mode: 1 sample per byte.
         // Use the larger bound so callers always size the buffer adequately.
@@ -841,5 +943,105 @@ impl Decoder for G722Decoder {
 
     fn channels(&self) -> u16 {
         1
+    }
+}
+
+#[cfg(all(test, feature = "std", feature = "plc"))]
+mod plc_tests {
+    use super::*;
+
+    const FRAME: usize = 320;
+
+    /// Voiced, speech-like: 8 harmonics of a pitch gliding 120 → 160 Hz,
+    /// under a slow amplitude envelope.
+    fn voice(n: usize) -> Vec<Sample> {
+        let mut phase = 0f32;
+        (0..n)
+            .map(|i| {
+                let t = i as f32 / 16000.0;
+                let f0 = 120.0 + 40.0 * (t / 2.0).min(1.0);
+                phase += 2.0 * std::f32::consts::PI * f0 / 16000.0;
+                let env = 0.6 + 0.4 * (2.0 * std::f32::consts::PI * 1.5 * t).sin();
+                let v: f32 = (1..=8).map(|k| (k as f32 * phase).sin() / k as f32).sum();
+                (5000.0 * env * v) as Sample
+            })
+            .collect()
+    }
+
+    fn packets(pcm: &[Sample]) -> Vec<Vec<u8>> {
+        let mut enc = G722Encoder::new();
+        pcm.chunks(FRAME).map(|c| enc.encode(c)).collect()
+    }
+
+    /// Error energy (dB relative to the reference) of `frames` packets
+    /// decoded right after losing `lost` packets at `at`.
+    fn error_after_loss(follow: bool, at: usize, lost: usize, frames: usize) -> f32 {
+        let pcm = voice(FRAME * (at + lost + frames + 2));
+        let pkts = packets(&pcm);
+        let mut reference = G722Decoder::new();
+        let mut dec = G722Decoder::new();
+        dec.enable_concealment();
+        let (mut err, mut sig) = (0f64, 0f64);
+        for (i, p) in pkts.iter().enumerate() {
+            let r = reference.decode(p);
+            if i >= at && i < at + lost {
+                let mut out = vec![0; FRAME];
+                if follow {
+                    dec.conceal_into(FRAME, &mut out).unwrap();
+                } else {
+                    dec.plc.as_mut().unwrap().conceal(&mut out);
+                }
+                continue;
+            }
+            let d = dec.decode(p);
+            if i >= at + lost && i < at + lost + frames {
+                for (a, b) in d.iter().zip(&r) {
+                    err += (*a as f64 - *b as f64).powi(2);
+                    sig += (*b as f64).powi(2);
+                }
+            }
+        }
+        (10.0 * (err / sig).log10()) as f32
+    }
+
+    #[test]
+    fn concealment_is_audible_and_fades() {
+        let pkts = packets(&voice(FRAME * 12));
+        let mut dec = G722Decoder::new();
+        dec.enable_concealment();
+        for p in &pkts[..10] {
+            dec.decode(p);
+        }
+        let first = dec.conceal(FRAME);
+        assert_eq!(first.len(), FRAME);
+        let rms = |s: &[Sample]| {
+            (s.iter().map(|x| (*x as f64).powi(2)).sum::<f64>() / s.len() as f64).sqrt()
+        };
+        assert!(rms(&first) > 500.0, "rms {}", rms(&first));
+        let later: Vec<_> = (0..3).map(|_| dec.conceal(FRAME)).collect();
+        assert!(later[2].iter().all(|s| *s == 0));
+    }
+
+    #[test]
+    fn following_the_state_through_a_loss_beats_freezing_it() {
+        // decoded audio right after a loss, against a decoder that lost
+        // nothing: closer when the state followed the concealment
+        let (mut better, mut total, mut gain) = (0, 0, 0f32);
+        for lost in [1, 2] {
+            for at in 8..60 {
+                let follow = error_after_loss(true, at, lost, 2);
+                let frozen = error_after_loss(false, at, lost, 2);
+                total += 1;
+                gain += frozen - follow;
+                if follow < frozen {
+                    better += 1;
+                }
+            }
+        }
+        let gain = gain / total as f32;
+        println!("follow closer in {better}/{total} losses, by {gain:.1} dB on average");
+        // measured: closer in 75/104, by 2.5 dB on average
+        assert!(better * 3 >= total * 2, "closer in only {better}/{total}");
+        assert!(gain > 1.5, "only {gain:.1} dB closer on average");
     }
 }

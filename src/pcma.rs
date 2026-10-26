@@ -1,4 +1,8 @@
+#[cfg(feature = "plc")]
+use super::plc::PitchConcealer;
 use super::{CodecError, Decoder, Encoder, Sample};
+#[cfg(feature = "plc")]
+use alloc::boxed::Box;
 
 const SEG_SHIFT: i16 = 4;
 const QUANT_MASK: i16 = 0x0F;
@@ -86,13 +90,25 @@ static ALAW_DECODE_TABLE: [i16; 256] = [
 ];
 
 /// Decoder for A-law (PCMA) format
-#[derive(Default)]
-pub struct PcmaDecoder {}
+pub struct PcmaDecoder {
+    /// Packet loss concealment, once enabled.
+    #[cfg(feature = "plc")]
+    plc: Option<Box<PitchConcealer>>,
+}
 
 impl PcmaDecoder {
     /// Creates a new PcmaDecoder instance
     pub fn new() -> Self {
-        Self {}
+        Self {
+            #[cfg(feature = "plc")]
+            plc: None,
+        }
+    }
+}
+
+impl Default for PcmaDecoder {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -104,7 +120,29 @@ impl Decoder for PcmaDecoder {
         for (i, &sample) in data.iter().enumerate() {
             out[i] = decode_a_law(sample);
         }
+        #[cfg(feature = "plc")]
+        if let Some(plc) = &mut self.plc {
+            plc.on_decoded(&mut out[..data.len()]);
+        }
         Ok(data.len())
+    }
+
+    #[cfg(feature = "plc")]
+    fn enable_concealment(&mut self) -> bool {
+        self.plc
+            .get_or_insert_with(|| Box::new(PitchConcealer::new(8000)));
+        true
+    }
+
+    /// Conceals with G.711 Appendix I style pitch repetition.
+    #[cfg(feature = "plc")]
+    fn conceal_into(&mut self, samples: usize, out: &mut [Sample]) -> Result<usize, CodecError> {
+        let Some(plc) = &mut self.plc else {
+            return Ok(0);
+        };
+        let out = out.get_mut(..samples).ok_or(CodecError::BufferTooSmall)?;
+        plc.conceal(out);
+        Ok(samples)
     }
 
     fn max_decode_samples(&self, n_bytes: usize) -> usize {

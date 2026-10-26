@@ -15,6 +15,8 @@ pub mod g729;
 pub mod opus;
 pub mod pcma;
 pub mod pcmu;
+#[cfg(feature = "plc")]
+mod plc;
 /// Default polyphase resampler (f32 core, exact integer timing).
 pub mod resampler;
 /// Alternative polyphase resampler with a Q15 fixed-point core, for targets
@@ -66,6 +68,46 @@ pub trait Decoder: Send + Sync {
 
     /// Get the number of channels.
     fn channels(&self) -> u16;
+
+    /// Turn on the decoder's own packet loss concealment, returning whether
+    /// [`Decoder::conceal_into`] will conceal. Off by default where keeping
+    /// it ready costs something on every decoded packet: G.711 and G.722
+    /// keep a history of the decoded audio, and have concealment only with
+    /// the `plc` feature. Opus's is part of the decoder and always on. The
+    /// default returns `false`: no concealment.
+    fn enable_concealment(&mut self) -> bool {
+        false
+    }
+
+    /// Conceal a lost packet: write `samples` samples per channel of audio
+    /// to play in its place into `out`, returning the number written
+    /// (`samples * channels`). The decoder's state carries on through the
+    /// loss as the codec allows, and the next packet decoded after it is
+    /// blended in.
+    ///
+    /// Call it once per lost packet, in order, between the `decode_into`
+    /// calls of the packets around the loss. Returns `Ok(0)`, writing
+    /// nothing, when the decoder has no concealment or it isn't enabled
+    /// (see [`Decoder::enable_concealment`]): the caller has to conceal the
+    /// gap itself.
+    fn conceal_into(&mut self, samples: usize, out: &mut [Sample]) -> Result<usize, CodecError> {
+        let _ = (samples, out);
+        Ok(0)
+    }
+
+    /// Convenience wrapper that allocates a `Vec` and calls `conceal_into`.
+    /// Empty when the decoder has no concealment of its own.
+    #[cfg(feature = "std")]
+    fn conceal(&mut self, samples: usize) -> PcmBuf {
+        let mut buf = vec![0i16; samples * self.channels() as usize];
+        match self.conceal_into(samples, &mut buf) {
+            Ok(n) => {
+                buf.truncate(n);
+                buf
+            }
+            Err(_) => Vec::new(),
+        }
+    }
 
     /// Convenience wrapper that allocates a `Vec` and calls `decode_into`.
     #[cfg(feature = "std")]
