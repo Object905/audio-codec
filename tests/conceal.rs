@@ -210,3 +210,19 @@ fn disabled_concealment_costs_a_pointer() {
         std::mem::size_of::<usize>()
     );
 }
+
+/// Without redundancy to rebuild from, `recover` conceals.
+#[cfg(feature = "plc")]
+#[test]
+fn recover_falls_back_to_concealment() {
+    let mut enc = create_encoder(CodecType::PCMA);
+    let mut dec = create_decoder(CodecType::PCMA);
+    dec.enable_concealment();
+    for f in 0..8 {
+        dec.decode(&enc.encode(&tone(8000, 160, f)));
+    }
+    let next = enc.encode(&tone(8000, 160, 9));
+    let recovered = dec.recover(&next, 160);
+    assert_eq!(recovered.len(), 160);
+    assert!(rms(&recovered) > 0.5 * rms(&tone(8000, 160, 8)));
+}

@@ -21,7 +21,8 @@ A collection of VoIP audio codecs implemented for Rust. This crate provides a un
   Opus needs an `alloc` (its internal working set is ~250 KB and is boxed).
 - **Resampler**: Built-in audio resampling utility.
 - **Packet loss concealment**: `Decoder::conceal_into` fills in for a lost
-  packet. Opus uses its own; G.711 and G.722 get pitch-repetition
+  packet, `Decoder::recover_into` rebuilds it from Opus in-band FEC. Opus
+  uses its own concealment; G.711 and G.722 get pitch-repetition
   concealment (G.711 Appendix I style), with G.722's ADPCM state carried
   through the loss, behind the `plc` feature and `enable_concealment()`.
 
@@ -134,7 +135,11 @@ fn main() {
 }
 ```
 
-- **Opus** uses its own concealment, always available.
+- **Opus** uses its own concealment, always available. With the packet
+  after the loss already at hand, `recover_into(next, ..)` (or `recover`)
+  rebuilds the lost one from its in-band FEC instead, where the sender
+  coded it (`OpusEncoder::set_inband_fec` with `set_packet_loss_perc`);
+  for other codecs it conceals.
 - **G.711 / G.722** repeat the last pitch period of the decoded audio,
   continuing the waveform, fading to silence 60 ms into a loss, and
   crossfade into the next decoded packet. G.722 also carries its ADPCM

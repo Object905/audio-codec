@@ -95,6 +95,39 @@ pub trait Decoder: Send + Sync {
         Ok(0)
     }
 
+    /// Rebuild a lost packet from `next`, the packet that followed it, when
+    /// the codec carries redundancy for it (Opus in-band FEC), into `out`
+    /// like [`Decoder::conceal_into`]. `next` is not consumed: decode it
+    /// with `decode_into` afterwards.
+    ///
+    /// Use it in place of `conceal_into` for the last packet of a loss when
+    /// the packet after it has already arrived (a jitter buffer usually has
+    /// it). Where the codec has no redundancy, or `next` carries none, this
+    /// conceals; the default is just `conceal_into`.
+    fn recover_into(
+        &mut self,
+        next: &[u8],
+        samples: usize,
+        out: &mut [Sample],
+    ) -> Result<usize, CodecError> {
+        let _ = next;
+        self.conceal_into(samples, out)
+    }
+
+    /// Convenience wrapper that allocates a `Vec` and calls `recover_into`.
+    /// Empty when the decoder can neither recover nor conceal.
+    #[cfg(feature = "std")]
+    fn recover(&mut self, next: &[u8], samples: usize) -> PcmBuf {
+        let mut buf = vec![0i16; samples * self.channels() as usize];
+        match self.recover_into(next, samples, &mut buf) {
+            Ok(n) => {
+                buf.truncate(n);
+                buf
+            }
+            Err(_) => Vec::new(),
+        }
+    }
+
     /// Convenience wrapper that allocates a `Vec` and calls `conceal_into`.
     /// Empty when the decoder has no concealment of its own.
     #[cfg(feature = "std")]

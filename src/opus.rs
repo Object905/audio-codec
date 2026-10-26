@@ -95,9 +95,11 @@ impl OpusDecoder {
 
 impl OpusDecoder {
     /// Conceal a lost frame of `samples` samples per channel with Opus's own
-    /// packet loss concealment, without the stereo→mono downmix.
+    /// packet loss concealment or, given `next`, rebuild it from the in-band
+    /// FEC of the packet after it; without the stereo→mono downmix.
     fn conceal_into_raw(
         &mut self,
+        next: Option<&[u8]>,
         samples: usize,
         out: &mut [Sample],
     ) -> Result<usize, CodecError> {
@@ -109,17 +111,36 @@ impl OpusDecoder {
         if out.len() < total {
             return Err(CodecError::BufferTooSmall);
         }
-        // opus-rs conceals a packet of 0 or 1 bytes, as libopus does with
-        // `data == NULL`
-        let len = self
-            .decoder
-            .decode(&[], samples, &mut self.w_output_f32[..total])
-            .map_err(|_| CodecError::DecodeFailed)?;
+        let pcm = &mut self.w_output_f32[..total];
+        let len = match next {
+            Some(next) => self.decoder.decode_fec(next, samples, pcm),
+            // opus-rs conceals a packet of 0 or 1 bytes, as libopus does
+            // with `data == NULL`
+            None => self.decoder.decode(&[], samples, pcm),
+        }
+        .map_err(|_| CodecError::DecodeFailed)?;
         let n = len * channels;
         for (o, f) in out[..n].iter_mut().zip(&self.w_output_f32[..n]) {
             *o = (f * 32768.0).clamp(-32768.0, 32767.0) as i16;
         }
         Ok(n)
+    }
+
+    /// `conceal_into_raw` with the stereo→mono downmix `decode` does.
+    #[cfg(feature = "std")]
+    fn conceal_downmixed(&mut self, next: Option<&[u8]>, samples: usize) -> PcmBuf {
+        let mut pcm = vec![0i16; samples * usize::from(self.channels)];
+        match self.conceal_into_raw(next, samples, &mut pcm) {
+            Ok(n) => pcm.truncate(n),
+            Err(_) => return Vec::new(),
+        }
+        if usize::from(self.channels) == 2 {
+            pcm = pcm
+                .chunks_exact(2)
+                .map(|chunk| ((chunk[0] as i32 + chunk[1] as i32) / 2) as i16)
+                .collect();
+        }
+        pcm
     }
 }
 
@@ -133,24 +154,31 @@ impl Decoder for OpusDecoder {
     /// an Opus frame size (a multiple of 2.5 ms, at most 20 ms); others
     /// fail with `DecodeFailed`.
     fn conceal_into(&mut self, samples: usize, out: &mut [Sample]) -> Result<usize, CodecError> {
-        self.conceal_into_raw(samples, out)
+        self.conceal_into_raw(None, samples, out)
     }
 
     /// Override the default to downmix stereo to mono, as `decode` does.
     #[cfg(feature = "std")]
     fn conceal(&mut self, samples: usize) -> PcmBuf {
-        let mut pcm = vec![0i16; samples * usize::from(self.channels)];
-        match self.conceal_into_raw(samples, &mut pcm) {
-            Ok(n) => pcm.truncate(n),
-            Err(_) => return Vec::new(),
-        }
-        if usize::from(self.channels) == 2 {
-            pcm = pcm
-                .chunks_exact(2)
-                .map(|chunk| ((chunk[0] as i32 + chunk[1] as i32) / 2) as i16)
-                .collect();
-        }
-        pcm
+        self.conceal_downmixed(None, samples)
+    }
+
+    /// Rebuilds the lost frame from `next`'s in-band FEC (libopus's
+    /// `decode_fec`), concealing what it doesn't cover. `samples` as for
+    /// `conceal_into`.
+    fn recover_into(
+        &mut self,
+        next: &[u8],
+        samples: usize,
+        out: &mut [Sample],
+    ) -> Result<usize, CodecError> {
+        self.conceal_into_raw(Some(next), samples, out)
+    }
+
+    /// Override the default to downmix stereo to mono, as `decode` does.
+    #[cfg(feature = "std")]
+    fn recover(&mut self, next: &[u8], samples: usize) -> PcmBuf {
+        self.conceal_downmixed(Some(next), samples)
     }
 
     fn decode_into(&mut self, data: &[u8], out: &mut [Sample]) -> Result<usize, CodecError> {
@@ -259,6 +287,21 @@ impl OpusEncoder {
     /// Enable or disable constant bitrate (CBR) mode.
     pub fn set_cbr(&mut self, cbr: bool) {
         self.encoder.use_cbr = cbr;
+    }
+
+    /// Enable or disable in-band FEC: SILK frames also carry a low-bitrate
+    /// copy of the previous frame, which a decoder can rebuild a lost packet
+    /// from (`Decoder::recover_into`). Only coded when the expected packet
+    /// loss (`set_packet_loss_perc`) is above zero and the bitrate leaves
+    /// room for it (e.g. 32 kb/s for wideband speech).
+    pub fn set_inband_fec(&mut self, enabled: bool) {
+        self.encoder.use_inband_fec = enabled;
+    }
+
+    /// Set the packet loss the encoder expects, in percent (0-100). It
+    /// trades bitrate for robustness, and gates in-band FEC.
+    pub fn set_packet_loss_perc(&mut self, percent: i32) {
+        self.encoder.packet_loss_perc = percent.clamp(0, 100);
     }
 
     /// Encode into a caller-provided packet buffer.
@@ -413,6 +456,90 @@ mod tests {
         let next = dec.decode(&enc.encode(&tone_frame(11)));
         assert_eq!(next.len(), 960);
         assert!(rms(&next) > 1000.0);
+    }
+
+    /// Voiced, speech-like 48 kHz mono: 8 harmonics of a pitch gliding
+    /// 120 → 180 Hz under a slow envelope.
+    fn voice(frames: usize) -> Vec<Vec<i16>> {
+        let mut phase = 0f32;
+        let pcm: Vec<i16> = (0..frames * 960)
+            .map(|i| {
+                let t = i as f32 / 48000.0;
+                let f0 = 120.0 + 60.0 * (t / 0.6).min(1.0);
+                phase += 2.0 * core::f32::consts::PI * f0 / 48000.0;
+                let env = 0.6 + 0.4 * (2.0 * core::f32::consts::PI * 2.0 * t).sin();
+                let v: f32 = (1..=8).map(|k| (k as f32 * phase).sin() / k as f32).sum();
+                (6000.0 * env * v) as i16
+            })
+            .collect();
+        pcm.chunks(960).map(<[i16]>::to_vec).collect()
+    }
+
+    #[test]
+    fn test_opus_recovers_a_lost_frame_from_inband_fec() {
+        // speech at 32 kb/s (SILK or Hybrid), told to expect loss so it codes
+        // FEC; at 16 kb/s fullband Hybrid it codes none
+        let mut enc = OpusEncoder::new(48000, 1);
+        enc.set_bitrate(32000);
+        enc.set_inband_fec(true);
+        enc.set_packet_loss_perc(20);
+        let packets: Vec<Vec<u8>> = voice(40).iter().map(|f| enc.encode(f)).collect();
+        // SILK or Hybrid: FEC lives in the SILK layer (TOC configs 0-15)
+        let has_silk = |p: &[u8]| p[0] >> 3 < 16;
+        assert!(packets.iter().all(|p| has_silk(p)), "coded without SILK");
+
+        let mut reference = OpusDecoder::new(48000, 1);
+        let clean: Vec<Vec<i16>> = packets.iter().map(|p| reference.decode(p)).collect();
+        let error_db = |out: &[i16], clean: &[i16]| {
+            let err: f64 = out
+                .iter()
+                .zip(clean)
+                .map(|(a, b)| (*a as f64 - *b as f64).powi(2))
+                .sum();
+            let sig: f64 = clean.iter().map(|b| (*b as f64).powi(2)).sum();
+            10.0 * (err / sig).log10()
+        };
+        let (mut recovered_db, mut concealed_db) = (0f64, 0f64);
+        let losses = [10, 17, 23, 31];
+        for &lost in &losses {
+            let mut recovering = OpusDecoder::new(48000, 1);
+            let mut concealing = OpusDecoder::new(48000, 1);
+            for p in &packets[..lost] {
+                recovering.decode(p);
+                concealing.decode(p);
+            }
+            let recovered = recovering.recover(&packets[lost + 1], 960);
+            let concealed = concealing.conceal(960);
+            assert_eq!(recovered.len(), 960);
+            recovered_db += error_db(&recovered, &clean[lost]);
+            concealed_db += error_db(&concealed, &clean[lost]);
+            // `next` is not consumed: it decodes as usual afterwards
+            assert_eq!(recovering.decode(&packets[lost + 1]).len(), 960);
+        }
+        let n = losses.len() as f64;
+        let (recovered_db, concealed_db) = (recovered_db / n, concealed_db / n);
+        println!(
+            "lost frame error: recovered {recovered_db:.1} dB, concealed {concealed_db:.1} dB"
+        );
+        // measured: recovered -11.7 dB, concealed -5.0 dB
+        assert!(
+            recovered_db < concealed_db - 4.0,
+            "FEC no better than concealment: {recovered_db:.1} vs {concealed_db:.1} dB"
+        );
+    }
+
+    #[test]
+    fn test_opus_recover_without_fec_conceals() {
+        let mut enc = OpusEncoder::new(48000, 1);
+        let packets: Vec<Vec<u8>> = voice(12).iter().map(|f| enc.encode(f)).collect();
+        let mut dec = OpusDecoder::new(48000, 1);
+        for p in &packets[..10] {
+            dec.decode(p);
+        }
+        // no FEC coded: the lost frame is concealed, still audible
+        let recovered = dec.recover(&packets[11], 960);
+        assert_eq!(recovered.len(), 960);
+        assert!(rms(&recovered) > 500.0, "rms {}", rms(&recovered));
     }
 
     #[test]
